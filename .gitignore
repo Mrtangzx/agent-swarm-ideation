@@ -1,0 +1,93 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints
+
+# ===== Node (LiveKit UI / tooling) =====
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# ===== Environment & Secrets =====
+.env
+.env.local
+.env.*.local
+*.pem
+!.env.example
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== OMC (operations & wiki) =====
+# .omc/state/    - session state (operational, regenerated)
+# .omc/sessions/ - session logs (regenerated)
+# .omc/wiki/     - LLM wiki, project-local per OMC skill spec
+.omc/
+
+# ===== Project-specific: agent-swarm runtime =====
+# LiveKit / Voice models (downloaded at runtime)
+models/
+*.bin
+*.pt
+*.onnx
+whisper-cache/
+piper-cache/
+
+# Sandbox / agent execution artifacts
+.agents/
+.runtime/
+checkpoints/
+
+# Langfuse / observability
+langfuse-data/
+langfuse_pgdata/
+langfuse_redis/
+
+# Logs
+logs/
+*.log
