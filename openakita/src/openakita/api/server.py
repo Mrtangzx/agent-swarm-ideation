@@ -1,0 +1,1072 @@
+"""
+FastAPI HTTP API server for OpenAkita.
+
+集成在 `openakita serve` 中，提供：
+- Chat (SSE streaming)
+- Models list
+- Health check
+- Skills management
+- File upload
+
+默认端口：18900
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import socket
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+import openakita._ensure_utf8  # noqa: F401  # Windows UTF-8 编码保护
+
+from .auth import WebAccessConfig, create_auth_middleware
+from .middleware_setup_gate import create_setup_gate_middleware
+from .routes import (
+    agents,
+    bug_report,
+    chat,
+    chat_models,
+    config,
+    diagnostics,
+    feishu_onboard,
+    files,
+    health,
+    hub,
+    identity,
+    im,
+    logs,
+    mcp,
+    memory,
+    memory_repair,
+    orgs,
+    pending_approvals,
+    qqbot_onboard,
+    scheduler,
+    sessions,
+    skill_categories,
+    skills,
+    token_stats,
+    upload,
+    wechat_onboard,
+    wecom_onboard,
+    workspace_io,
+    workspaces,
+)
+from .routes import (
+    web_search as web_search_routes,
+)
+
+try:
+    from .routes import plugins as plugins_routes
+except ImportError:
+    plugins_routes = None
+    logging.getLogger(__name__).debug("Plugin routes not available")
+from .routes import (
+    auth as auth_routes,
+)
+from .routes import (
+    websocket as ws_routes,
+)
+
+logger = logging.getLogger(__name__)
+
+# Default port. The actual host is decided by
+# :func:`openakita.api.host_resolution.resolve_api_host` at startup and passed
+# into :func:`start_api_server` explicitly. Do not import a module-level
+# ``API_HOST`` constant — it was removed because it captured ``os.environ``
+# at import time, which is too early (``.env`` may not be loaded yet) and
+# made the resolution logic invisible to tests.
+API_PORT = int(os.environ.get("API_PORT", "18900"))
+
+
+def get_api_host_for_health_display(app_state: Any | None = None) -> str:
+    """Best-effort answer to "which host did we bind to?" for /api/health.
+
+    Prefers the value stored on FastAPI ``app.state.actual_bind_host`` (the
+    truth, set by :func:`start_api_server` after uvicorn binds), then falls
+    back to the ``API_HOST`` env var, finally to ``127.0.0.1``.
+    """
+    if app_state is not None:
+        actual = getattr(app_state, "actual_bind_host", None)
+        if isinstance(actual, str) and actual:
+            return actual
+    return os.environ.get("API_HOST", "").strip() or "127.0.0.1"
+
+
+def is_port_free(host: str, port: int) -> bool:
+    """检测端口是否可用（快速单次检测）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def wait_for_port_free(host: str, port: int, timeout: float = 30.0) -> bool:
+    """等待端口释放，返回 True 表示端口可用。
+
+    用于重启场景下等待旧进程释放 TCP 端口（避免 TIME_WAIT 竞态）。
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if is_port_free(host, port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _find_web_dist() -> Path | None:
+    """Locate the web frontend dist directory.
+
+    Search order:
+    1. openakita/web/ (pip wheel install & PyInstaller bundle)
+    2. apps/setup-center/dist-web/ (development)
+    """
+    # Inside the installed package
+    pkg_web = Path(__file__).parent.parent / "web"
+    if (pkg_web / "index.html").exists():
+        return pkg_web
+
+    # Development: relative to project root
+    dev_web = Path(__file__).parent.parent.parent.parent / "apps" / "setup-center" / "dist-web"
+    if (dev_web / "index.html").exists():
+        return dev_web
+
+    return None
+
+
+def _find_docs_dist() -> Path | None:
+    """Locate bundled user docs dist directory.
+
+    Search order:
+    1. openakita/docs_dist/ (pip wheel install)
+    2. docs-site/.vitepress/dist/ (development)
+    """
+    pkg_docs = Path(__file__).parent.parent / "docs_dist"
+    if (pkg_docs / "index.html").exists():
+        return pkg_docs
+
+    dev_docs = Path(__file__).parent.parent.parent.parent / "docs-site" / ".vitepress" / "dist"
+    if (dev_docs / "index.html").exists():
+        return dev_docs
+
+    return None
+
+
+def _docs_version_matches_bundled(bundled: Path, version_dir: Path) -> bool:
+    """Return True when the deployed docs look current enough to reuse."""
+    if not version_dir.is_dir():
+        return False
+
+    try:
+        bundled_files = {path.relative_to(bundled) for path in bundled.rglob("*") if path.is_file()}
+        deployed_files = {path.relative_to(version_dir) for path in version_dir.rglob("*") if path.is_file()}
+        if bundled_files != deployed_files:
+            return False
+
+        for relative_path in bundled_files:
+            source_path = bundled / relative_path
+            deployed_path = version_dir / relative_path
+            if not deployed_path.is_file():
+                return False
+            source_stat = source_path.stat()
+            deployed_stat = deployed_path.stat()
+            if source_stat.st_size != deployed_stat.st_size:
+                return False
+            if source_stat.st_mtime_ns == deployed_stat.st_mtime_ns:
+                continue
+            if source_path.read_bytes() != deployed_path.read_bytes():
+                return False
+
+        for relative_name in ("index.html", "hashmap.json", "versions.html"):
+            source_path = bundled / relative_name
+            deployed_path = version_dir / relative_name
+            if source_path.is_file():
+                if not deployed_path.is_file():
+                    return False
+                if source_path.read_bytes() != deployed_path.read_bytes():
+                    return False
+    except OSError:
+        return False
+
+    return True
+
+
+def _sync_docs_tree(bundled: Path, version_dir: Path) -> None:
+    import shutil
+
+    version_dir.mkdir(parents=True, exist_ok=True)
+    bundled_files: set[Path] = set()
+    bundled_dirs: set[Path] = set()
+
+    for source_path in bundled.rglob("*"):
+        relative_path = source_path.relative_to(bundled)
+        if source_path.is_dir():
+            bundled_dirs.add(relative_path)
+            (version_dir / relative_path).mkdir(parents=True, exist_ok=True)
+            continue
+        if source_path.is_file():
+            bundled_files.add(relative_path)
+            deployed_path = version_dir / relative_path
+            deployed_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, deployed_path)
+
+    deployed_files = [path for path in version_dir.rglob("*") if path.is_file()]
+    for deployed_path in deployed_files:
+        if deployed_path.relative_to(version_dir) not in bundled_files:
+            deployed_path.unlink()
+
+    deployed_dirs = sorted(
+        (path for path in version_dir.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for deployed_path in deployed_dirs:
+        if deployed_path.relative_to(version_dir) not in bundled_dirs:
+            deployed_path.rmdir()
+
+
+def _record_docs_version(docs_root: Path, version_clean: str) -> None:
+    import json
+
+    versions_file = docs_root / "versions.json"
+    try:
+        versions = json.loads(versions_file.read_text("utf-8")) if versions_file.exists() else []
+        if not isinstance(versions, list):
+            versions = []
+        if version_clean not in versions:
+            versions.insert(0, version_clean)
+            versions_file.write_text(json.dumps(versions, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not update docs versions index: {e}")
+
+
+def _deploy_docs(data_dir: Path, app_version: str) -> Path | None:
+    """Deploy bundled docs to data/docs/v{version}/ and refresh same-version assets.
+
+    Historical versions are never deleted so users can switch between them.
+    """
+    bundled = _find_docs_dist()
+    if not bundled:
+        return None
+
+    docs_root = data_dir / "docs"
+    version_clean = app_version.split("+")[0]
+    version_dir = docs_root / f"v{version_clean}"
+
+    docs_root.mkdir(parents=True, exist_ok=True)
+    if _docs_version_matches_bundled(bundled, version_dir):
+        _record_docs_version(docs_root, version_clean)
+        return docs_root
+
+    try:
+        _sync_docs_tree(bundled, version_dir)
+    except Exception as e:
+        logger.warning(f"Could not deploy user docs v{version_clean}: {e}")
+        if version_dir.exists():
+            _record_docs_version(docs_root, version_clean)
+            return docs_root
+        return None
+
+    logger.info(f"Deployed user docs v{version_clean} → {version_dir}")
+    _record_docs_version(docs_root, version_clean)
+
+    return docs_root
+
+
+def _mount_web_frontend(app: FastAPI) -> None:
+    """Mount the web frontend static files if available.
+
+    Uses StaticFiles for /web/* with html=True for SPA fallback (index.html).
+    """
+    import mimetypes
+
+    from fastapi.staticfiles import StaticFiles
+
+    # On some Windows systems the registry maps .js to text/plain, causing
+    # browsers to reject ES module scripts.  Ensure correct MIME types are
+    # registered before StaticFiles serves any content.
+    _mime_overrides = {
+        ".js": "application/javascript",
+        ".mjs": "application/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".wasm": "application/wasm",
+        ".svg": "image/svg+xml",
+    }
+    for ext, mime in _mime_overrides.items():
+        mimetypes.add_type(mime, ext)
+
+    web_dist = _find_web_dist()
+    if not web_dist:
+        logger.debug("Web frontend not found, skipping static file mount")
+        return
+
+    logger.info(f"Mounting web frontend from {web_dist}")
+    app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web-frontend")
+
+
+def _has_web_frontend_mount(app: FastAPI) -> bool:
+    return any(getattr(route, "name", None) == "web-frontend" for route in app.routes)
+
+
+def create_app(
+    agent: Any = None,
+    shutdown_event: asyncio.Event | None = None,
+    session_manager: Any = None,
+    gateway: Any = None,
+    orchestrator: Any = None,
+    agent_pool: Any = None,
+) -> FastAPI:
+    """Create the FastAPI application with all routes mounted."""
+
+    from openakita import get_version_string
+
+    tags_metadata = [
+        {"name": "认证", "description": "登录、登出、Token 刷新"},
+        {"name": "对话", "description": "聊天交互、消息控制"},
+        {"name": "智能体", "description": "Agent 配置文件、Bot 管理、协作拓扑"},
+        {"name": "模型", "description": "可用模型/端点列表"},
+        {"name": "配置", "description": "工作区配置、环境变量、端点管理"},
+        {"name": "技能", "description": "技能市场、安装、配置"},
+        {"name": "MCP", "description": "MCP 服务器连接与工具管理"},
+        {"name": "记忆", "description": "长期记忆 CRUD 与向量检索"},
+        {"name": "会话", "description": "会话历史管理"},
+        {"name": "文件", "description": "文件浏览与上传"},
+        {"name": "身份", "description": "AI 身份定义文件管理"},
+        {"name": "定时任务", "description": "计划任务调度"},
+        {"name": "即时通讯", "description": "IM 渠道与消息"},
+        {"name": "Hub", "description": "Agent/Skill 导入导出与市场"},
+        {"name": "工作区", "description": "备份、导入导出"},
+        {"name": "健康检查", "description": "服务健康、诊断、调试"},
+        {"name": "统计", "description": "Token 用量统计"},
+        {"name": "日志", "description": "服务日志查询"},
+        {"name": "反馈", "description": "Bug 报告与功能建议"},
+        {"name": "WebSocket", "description": "实时事件推送"},
+        {"name": "系统", "description": "根路径、关机等系统操作"},
+    ]
+
+    app = FastAPI(
+        title="OpenAkita API",
+        description=(
+            "OpenAkita 智能体平台 HTTP API\n\n"
+            "提供对话、Agent 管理、技能配置、MCP 工具、定时任务等完整接口。\n\n"
+            "- Swagger UI: `/docs`\n"
+            "- ReDoc: `/redoc`"
+        ),
+        version=get_version_string(),
+        openapi_tags=tags_metadata,
+    )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(request, exc: RequestValidationError):
+        """Return Pydantic validation errors as a flat string detail
+        so the frontend never receives raw error objects."""
+        msgs = []
+        for err in exc.errors():
+            loc = " → ".join(str(part) for part in err.get("loc", []))
+            msg = err.get("msg", "validation error")
+            msgs.append(f"{loc}: {msg}" if loc else msg)
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "; ".join(msgs) if msgs else "Validation error"},
+        )
+
+    # Web access authentication — registered BEFORE CORS so that in Starlette's
+    # middleware stack (last-added = outermost) CORS wraps auth, ensuring all
+    # responses (including 401) carry proper CORS headers.
+    try:
+        from openakita.config import settings
+
+        data_dir = Path(settings.project_root) / "data"
+    except Exception:
+        data_dir = Path.cwd() / "data"
+    web_access_config = WebAccessConfig(data_dir)
+    app.state.web_access_config = web_access_config
+
+    auth_mw = create_auth_middleware(web_access_config)
+    app.middleware("http")(auth_mw)
+
+    # Setup gate runs **before** the auth middleware on the inbound side
+    # (FastAPI middleware is LIFO: added later = executed earlier). It
+    # short-circuits non-loopback requests with HTTP 428 when the web-access
+    # password has not been configured yet, so the frontend can route the
+    # user to the SetupView before any 401 noise.
+    setup_gate_mw = create_setup_gate_middleware(web_access_config)
+    app.middleware("http")(setup_gate_mw)
+
+    # CORS configuration (outermost middleware — added last)
+    # NOTE: allow_origins=["*"] is incompatible with allow_credentials=True per
+    # the browser spec.  When no explicit origins are configured we fall back to
+    # allow_origin_regex which matches any origin, achieving the same permissive
+    # behaviour while satisfying the spec.
+    cors_origins = os.environ.get("CORS_ORIGINS", "").strip()
+    cors_kwargs: dict[str, Any] = {
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+    if cors_origins:
+        origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+        # Always include Capacitor mobile origins so mobile apps work
+        # regardless of what the user configured in CORS_ORIGINS.
+        for cap_origin in ("http://localhost", "capacitor://localhost"):
+            if cap_origin not in origins:
+                origins.append(cap_origin)
+        cors_kwargs["allow_origins"] = origins
+    else:
+        cors_kwargs["allow_origin_regex"] = r".*"
+    app.add_middleware(CORSMiddleware, **cors_kwargs)
+
+    # Store references in app state
+    app.state.agent = agent
+    app.state.shutdown_event = shutdown_event
+    app.state.session_manager = session_manager
+    app.state.gateway = gateway
+    app.state.orchestrator = orchestrator
+    app.state.agent_pool = agent_pool
+    app.state.startup_phase = "http_ready" if gateway is None else "running"
+    app.state.readiness = {
+        "phase": app.state.startup_phase,
+        "http_ready": True,
+        "im_ready": gateway is not None,
+        "ready": gateway is not None,
+    }
+
+    if agent is not None:
+        pm = getattr(agent, "_plugin_manager", None)
+        if pm is not None:
+            # Writes go to the shared backing dict; ``_host_refs`` is a filtered
+            # read-only view for plugins (no ``__setitem__`` / ``pop``).
+            ext = pm._external_host_refs
+            ext["api_app"] = app
+            pending = ext.pop("_pending_plugin_routers", [])
+            for plugin_id, router in pending:
+                try:
+                    app.include_router(router, prefix=f"/api/plugins/{plugin_id}")
+                    logger.info("Mounted pending plugin routes for '%s'", plugin_id)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to mount pending routes for plugin '%s': %s", plugin_id, e
+                    )
+
+            pending_ui = ext.pop("_pending_plugin_ui_mounts", [])
+            for plugin_id, ui_dist_dir in pending_ui:
+                try:
+                    pm._do_mount_plugin_ui(app, plugin_id, ui_dist_dir)
+                except Exception as e:
+                    logger.warning("Failed to mount pending UI for plugin '%s': %s", plugin_id, e)
+
+    # Initialize OrgManager & OrgRuntime
+    from openakita.orgs.manager import OrgManager
+    from openakita.orgs.runtime import OrgRuntime
+    from openakita.orgs.templates import ensure_builtin_templates
+
+    org_manager = OrgManager(data_dir)
+    ensure_builtin_templates(data_dir / "org_templates")
+    app.state.org_manager = org_manager
+    org_runtime = OrgRuntime(org_manager)
+    app.state.org_runtime = org_runtime
+    from openakita.orgs.command_service import OrgCommandService, set_command_service
+
+    org_command_service = OrgCommandService(org_runtime, session_manager)
+    set_command_service(org_command_service)
+    app.state.org_command_service = org_command_service
+
+    # Mount routes
+    app.include_router(auth_routes.router, tags=["认证"])
+    app.include_router(agents.router, tags=["智能体"])
+    app.include_router(bug_report.router, tags=["反馈"])
+    app.include_router(chat.router, tags=["对话"])
+    app.include_router(chat_models.router, tags=["模型"])
+    app.include_router(config.router, tags=["配置"])
+    app.include_router(diagnostics.router, tags=["诊断"])
+    app.include_router(feishu_onboard.router, tags=["飞书扫码"])
+    app.include_router(qqbot_onboard.router, tags=["QQ扫码"])
+    app.include_router(wechat_onboard.router, tags=["微信扫码"])
+    app.include_router(wecom_onboard.router, tags=["企微扫码"])
+    app.include_router(files.router, tags=["文件"])
+    app.include_router(health.router, tags=["健康检查"])
+    app.include_router(im.router, tags=["即时通讯"])
+    app.include_router(logs.router, tags=["日志"])
+    app.include_router(mcp.router, tags=["MCP"])
+    app.include_router(memory.router, tags=["记忆"])
+    app.include_router(memory_repair.router, tags=["记忆修复"])
+    app.include_router(scheduler.router, tags=["定时任务"])
+    app.include_router(pending_approvals.router, tags=["待审批"])
+    app.include_router(sessions.router, tags=["会话"])
+    app.include_router(skills.router, tags=["技能"])
+    app.include_router(skill_categories.router, tags=["技能分类"])
+    app.include_router(token_stats.router, tags=["统计"])
+    app.include_router(upload.router, tags=["文件"])
+    app.include_router(web_search_routes.router)
+    app.include_router(workspace_io.router, tags=["工作区"])
+    app.include_router(workspaces.router, tags=["工作区管理"])
+    app.include_router(ws_routes.router, tags=["WebSocket"])
+    app.include_router(hub.router, tags=["Hub"])
+    app.include_router(identity.router, tags=["身份"])
+    app.include_router(orgs.router, tags=["组织编排"])
+    app.include_router(orgs.inbox_router, tags=["组织消息中心"])
+    if plugins_routes is not None:
+        app.include_router(plugins_routes.router)
+
+    @app.get("/", tags=["系统"])
+    async def root():
+        # If web frontend is available, redirect to it
+        web_dist = _find_web_dist()
+        if web_dist or _has_web_frontend_mount(app):
+            from fastapi.responses import RedirectResponse
+
+            return RedirectResponse(url="/web/")
+        return {
+            "service": "openakita",
+            "api_version": "1.0.0",
+            "status": "running",
+        }
+
+    # ── Serve uploaded avatar files ──
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+
+    from openakita.config import settings as _settings
+
+    _avatar_dir = _settings.data_dir / "avatars"
+    _avatar_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/api/avatars", _StaticFiles(directory=str(_avatar_dir)), name="avatars")
+
+    # NOTE: prior to SDK 0.7.0 we mounted /api/plugins/_sdk/* here to serve
+    # bootstrap.js and the shared ui-kit out of the openakita_plugin_sdk
+    # wheel. The SDK no longer ships any frontend assets — every plugin UI
+    # is now expected to be self-contained under its own ui/dist/_assets/
+    # directory (see plugins/tongyi-image and plugins/seedance-video for
+    # working examples, or plugins-archive/_shared/web-uikit/README.md for
+    # how to revive an archived plugin's UI). Do not re-add this mount.
+
+    # ── Serve versioned user docs ──
+    from openakita import get_version_string as _get_ver
+
+    _docs_ver = _get_ver().split("+")[0]
+    _docs_root = _deploy_docs(data_dir, _docs_ver)
+    if _docs_root:
+        from fastapi.responses import RedirectResponse as _Redirect
+        from fastapi.staticfiles import StaticFiles as _DocsStatic
+
+        @app.get("/user-docs", include_in_schema=False)
+        @app.get("/user-docs/", include_in_schema=False)
+        async def _docs_redirect(request: Request):
+            target = f"/user-docs/v{_docs_ver}/"
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            response = _Redirect(target)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        app.mount(
+            "/user-docs",
+            _DocsStatic(directory=str(_docs_root), html=True),
+            name="user-docs",
+        )
+        logger.info(f"Mounted user docs at /user-docs/ from {_docs_root}")
+
+    # ── Serve web frontend static files ──
+    _mount_web_frontend(app)
+
+    @app.on_event("startup")
+    async def _import_pending_feedback():
+        """Import any feedback records staged by Tauri while the backend was down."""
+        try:
+            from openakita.config import settings
+            home = settings.openakita_home
+        except Exception:
+            home = Path.home() / ".openakita"
+        pending = home / "pending_feedback.json"
+        if not pending.exists():
+            return
+        try:
+            import json as _json
+            records = _json.loads(pending.read_text("utf-8"))
+            if not isinstance(records, list):
+                pending.unlink(missing_ok=True)
+                return
+            from .routes import feedback_store
+            imported = 0
+            for rec in records:
+                try:
+                    await feedback_store.save_record(
+                        report_id=rec.get("reportId") or rec.get("report_id", ""),
+                        feedback_token=rec.get("feedbackToken") or rec.get("feedback_token"),
+                        title=rec.get("title", ""),
+                        report_type=rec.get("reportType") or rec.get("report_type", "bug"),
+                        contact_email=rec.get("contactEmail") or rec.get("contact_email", ""),
+                        submitted_at=rec.get("submittedAt") or rec.get("submitted_at"),
+                    )
+                    imported += 1
+                except Exception as rec_err:
+                    logger.warning("Skip bad pending feedback record: %s", rec_err)
+            pending.unlink(missing_ok=True)
+            if imported:
+                logger.info(
+                    "Imported %d pending feedback record(s) from Tauri offline staging",
+                    imported,
+                )
+        except Exception as exc:
+            logger.warning("Failed to import pending feedback: %s", exc)
+            pending.unlink(missing_ok=True)
+
+    @app.on_event("startup")
+    async def _cleanup_memory_recovery_pending():
+        try:
+            from .routes.memory_repair import _cleanup_old_recovery_pending
+
+            await asyncio.to_thread(_cleanup_old_recovery_pending)
+        except Exception as e:
+            logger.debug("[Startup] Memory recovery pending cleanup skipped: %s", e)
+
+    @app.on_event("startup")
+    async def _cleanup_expired_resume_state():
+        """Issue #608: drop crash-leftover cancel-resume snapshots in
+        ``data/working_messages/`` so a process that died mid-turn doesn't
+        keep re-injecting yesterday's half-finished tool state on resume."""
+        try:
+            from openakita.core.cancel_cleanup import cleanup_expired_working_messages
+
+            removed = await asyncio.to_thread(
+                cleanup_expired_working_messages, base_dir=data_dir
+            )
+            if removed:
+                logger.info("[Startup] Removed %d expired cancel-resume snapshot(s)", removed)
+        except Exception as e:
+            logger.debug("[Startup] Cancel-resume snapshot cleanup skipped: %s", e)
+
+    @app.on_event("startup")
+    async def _wire_pending_approvals_sse():
+        """C9c-2: bridge PendingApprovalsStore events to WebSocket broadcast.
+
+        The Store is policy-loop-agnostic; we install a sync hook that does
+        ``asyncio.ensure_future(broadcast_event(...))`` on the API loop. The
+        broadcast helper itself is cross-loop safe (engine_bridge), so this
+        works regardless of which loop the Store mutation happens on.
+        """
+        try:
+            from openakita.api.routes.websocket import fire_event
+            from openakita.core.pending_approvals import get_pending_approvals_store
+
+            def _hook(event_type: str, payload: dict) -> None:
+                fire_event(event_type, payload)
+
+            get_pending_approvals_store().set_event_hook(_hook)
+            logger.info("[Startup] PendingApprovals SSE hook wired")
+        except Exception as e:
+            logger.warning("[Startup] PendingApprovals SSE wire failed: %s", e)
+
+        # C17 Phase B.4：把 UIConfirmBus 的 confirm_initiated /
+        # confirm_revoked 广播绑到同一条 fire_event 通道，让多端 UI 共享
+        # confirm 生命周期信号。
+        try:
+            from openakita.api.routes.websocket import fire_event
+            from openakita.core.ui_confirm_bus import get_ui_confirm_bus
+
+            def _confirm_hook(event_type: str, payload: dict) -> None:
+                fire_event(event_type, payload)
+
+            get_ui_confirm_bus().set_broadcast_hook(_confirm_hook)
+            logger.info("[Startup] UIConfirmBus broadcast hook wired")
+        except Exception as e:
+            logger.warning("[Startup] UIConfirmBus broadcast wire failed: %s", e)
+
+        # C18 Phase A：POLICIES.yaml hot-reload。默认 disabled；用户在
+        # POLICIES.yaml 的 ``hot_reload.enabled: true`` opt-in 即生效。
+        # 失败安全：``start_hot_reloader`` 内部全 try/except，未启动也不
+        # 影响 server 启动。
+        try:
+            from openakita.core.policy_v2.hot_reload import start_hot_reloader
+
+            reloader = start_hot_reloader()
+            if reloader is not None:
+                logger.info("[Startup] PolicyHotReloader started")
+            else:
+                logger.debug(
+                    "[Startup] PolicyHotReloader not started "
+                    "(disabled or no POLICIES.yaml)"
+                )
+        except Exception as e:
+            logger.warning("[Startup] PolicyHotReloader wire failed: %s", e)
+
+    @app.post("/api/shutdown", tags=["系统"])
+    async def shutdown(request: Request):
+        """Gracefully shut down the OpenAkita service process.
+
+        Only allowed from localhost for security.
+        Uses the shared shutdown_event to trigger the same graceful cleanup
+        path as SIGINT/SIGTERM (sessions saved, IM adapters stopped, etc.).
+        """
+        from .auth import get_client_ip
+
+        trust_proxy = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true", "yes")
+        real_ip = get_client_ip(request, trust_proxy=trust_proxy)
+        is_local = real_ip in ("127.0.0.1", "::1", "localhost") or (
+            real_ip.startswith("::ffff:") and real_ip[7:] == "127.0.0.1"
+        )
+        if not is_local:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Shutdown only allowed from localhost"},
+            )
+        logger.info("Shutdown requested via API")
+        if app.state.shutdown_event is not None:
+            app.state.shutdown_event.set()
+            return {"status": "shutting_down"}
+        logger.warning("No shutdown_event available, shutdown request ignored")
+        return {"status": "error", "message": "shutdown not available in this mode"}
+
+    @app.on_event("startup")
+    async def _startup_org_runtime():
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = 0.5
+        if hasattr(app.state, "org_runtime") and app.state.org_runtime:
+            try:
+                from openakita.core.engine_bridge import to_engine
+
+                await to_engine(app.state.org_runtime.start())
+            except Exception as e:
+                logger.warning(f"OrgRuntime startup error (non-fatal): {e}")
+
+        # Endpoint health check: detect stale/broken endpoints early
+        try:
+            _agent = getattr(app.state, "agent", None)
+            _brain = getattr(_agent, "brain", None) if _agent else None
+            _llm_client = getattr(_brain, "_llm_client", None) if _brain else None
+            if _llm_client and hasattr(_llm_client, "startup_health_check"):
+                _results = await _llm_client.startup_health_check()
+                _ok = sum(1 for v in _results.values() if v == "ok")
+                _fail = len(_results) - _ok
+                if _fail:
+                    logger.warning(
+                        f"[Startup] Endpoint health check: {_ok} ok, {_fail} failed — "
+                        f"{', '.join(f'{k}={v}' for k, v in _results.items() if v != 'ok')}"
+                    )
+                else:
+                    logger.info(f"[Startup] All {_ok} endpoints healthy")
+        except Exception as e:
+            logger.debug(f"[Startup] Endpoint health check skipped: {e}")
+
+        # Compiler endpoint health check
+        try:
+            _agent = getattr(app.state, "agent", None)
+            _brain = getattr(_agent, "brain", None) if _agent else None
+            _compiler_client = getattr(_brain, "_compiler_client", None) if _brain else None
+            if _compiler_client and hasattr(_compiler_client, "startup_health_check"):
+                comp_result = await _compiler_client.startup_health_check()
+                comp_failed = {k: v for k, v in comp_result.items() if v != "ok"}
+                if comp_failed:
+                    for ep_name, status in comp_failed.items():
+                        _brain._compiler_on_failure(f"startup: {ep_name}={status}")
+                    logger.warning(
+                        f"[Startup] Compiler health check failed: "
+                        f"{', '.join(f'{k}={v}' for k, v in comp_failed.items())}. "
+                        f"Compiler tasks will use main model."
+                    )
+                else:
+                    logger.info(
+                        f"[Startup] Compiler endpoints all healthy: {list(comp_result.keys())}"
+                    )
+        except Exception as e:
+            logger.debug(f"[Startup] Compiler health check skipped: {e}")
+
+    @app.on_event("shutdown")
+    async def _shutdown_org_runtime():
+        if hasattr(app.state, "org_runtime") and app.state.org_runtime:
+            try:
+                from openakita.core.engine_bridge import to_engine
+
+                await to_engine(app.state.org_runtime.shutdown())
+            except Exception as e:
+                logger.warning(f"OrgRuntime shutdown error: {e}")
+
+    @app.on_event("shutdown")
+    async def _shutdown_policy_hot_reloader():
+        try:
+            from openakita.core.policy_v2.hot_reload import stop_hot_reloader
+
+            stop_hot_reloader(timeout=2.0)
+        except Exception as e:
+            logger.debug("[Shutdown] PolicyHotReloader stop skipped: %s", e)
+
+    @app.on_event("shutdown")
+    async def _shutdown_memory_storage():
+        try:
+            from openakita.memory.storage import checkpoint_and_close_all_storages
+
+            await asyncio.wait_for(
+                asyncio.to_thread(checkpoint_and_close_all_storages),
+                timeout=3.0,
+            )
+        except TimeoutError:
+            logger.warning("[Shutdown] Memory checkpoint timeout (3s), proceeding")
+        except Exception as e:
+            logger.warning("[Shutdown] Memory checkpoint skipped: %s", e)
+
+    @app.on_event("startup")
+    async def _start_async_audit_writer():
+        """C22 P3-2 follow-up: wire the async audit writer to the API loop.
+
+        Without this hook the writer is dead code — ``AuditLogger.log()``
+        always sees ``get_async_audit_writer(...)`` returning ``None`` and
+        falls back to the per-row filelock sync path. After this hook the
+        same code path coalesces writes into batches transparently.
+
+        Fail-safe: any exception here logs WARNING and leaves the system
+        on the sync path; nothing downstream relies on the async writer
+        being up.
+        """
+        try:
+            from openakita.core.audit_logger import DEFAULT_AUDIT_PATH
+            from openakita.core.policy_v2.audit_writer import (
+                start_global_audit_writer,
+            )
+
+            try:
+                from openakita.core.policy_v2.global_engine import get_config_v2
+
+                cfg = get_config_v2().audit
+                path = cfg.log_path if (cfg and cfg.enabled) else None
+            except Exception:
+                path = None
+            if not path:
+                path = DEFAULT_AUDIT_PATH
+
+            await start_global_audit_writer(path)
+            logger.info("[Startup] AsyncBatchAuditWriter started for %s", path)
+        except Exception as e:
+            logger.warning(
+                "[Startup] AsyncBatchAuditWriter not started; sync fallback "
+                "remains active: %s",
+                e,
+            )
+
+    @app.on_event("shutdown")
+    async def _shutdown_async_audit_writer():
+        """Drain + stop the async audit writer.
+
+        Bounded by ``stop()``'s internal timeout (split between sentinel
+        delivery and worker drain); anything still queued past that
+        deadline is logged + dropped rather than blocking shutdown.
+        """
+        try:
+            from openakita.core.policy_v2.audit_writer import (
+                stop_global_audit_writer,
+            )
+
+            await stop_global_audit_writer()
+            logger.info("[Shutdown] AsyncBatchAuditWriter stopped")
+        except Exception as e:
+            logger.warning("[Shutdown] AsyncBatchAuditWriter stop error: %s", e)
+
+    return app
+
+
+async def start_api_server(
+    agent: Any = None,
+    shutdown_event: asyncio.Event | None = None,
+    session_manager: Any = None,
+    gateway: Any = None,
+    orchestrator: Any = None,
+    agent_pool: Any = None,
+    host: str = "127.0.0.1",
+    port: int = API_PORT,
+    max_retries: int = 5,
+) -> asyncio.Task:
+    """
+    Start the HTTP API server in a **dedicated background thread** with its
+    own asyncio event loop ("API loop").
+
+    The calling loop becomes the "engine loop" — it keeps running Agent,
+    OrgRuntime, Scheduler, Gateway and all other heavy async work.  The API
+    loop only handles HTTP request/response and WebSocket I/O, so it stays
+    responsive even when the engine is saturated with LLM calls.
+
+    Returns a proxy ``asyncio.Task`` in the engine loop.  Cancelling this
+    task triggers a graceful uvicorn shutdown.
+
+    Raises RuntimeError if the server cannot start after all retries.
+    """
+    import threading
+
+    import uvicorn
+
+    # 端口预检：如果端口不可用，先等待释放（处理 TIME_WAIT 等场景）
+    if not is_port_free(host, port):
+        logger.warning(f"Port {port} is currently in use, waiting for it to be released...")
+        freed = await asyncio.to_thread(wait_for_port_free, host, port, 30.0)
+        if not freed:
+            raise RuntimeError(
+                f"Port {port} is still in use after waiting 30s. "
+                f"Another process may be occupying it."
+            )
+        logger.info(f"Port {port} is now available")
+
+    engine_loop = asyncio.get_running_loop()
+
+    app = create_app(
+        agent=agent,
+        shutdown_event=shutdown_event,
+        session_manager=session_manager,
+        gateway=gateway,
+        orchestrator=orchestrator,
+        agent_pool=agent_pool,
+    )
+    app.state.engine_loop = engine_loop
+    app.state.actual_bind_host = host
+    app.state.actual_bind_port = port
+
+    config = uvicorn.Config(
+        app=app,
+        host=host,
+        port=port,
+        log_level="warning",
+        access_log=False,
+        http="h11",
+        log_config=None,
+    )
+    server = uvicorn.Server(config)
+
+    # ── Launch uvicorn in a background thread ────────────────────────
+    api_loop_holder: list[asyncio.AbstractEventLoop] = []
+    thread_ready = threading.Event()
+    thread_error: list[Exception] = []
+
+    def _api_thread() -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            api_loop_holder.append(loop)
+            thread_ready.set()
+            loop.run_until_complete(server.serve())
+        except Exception as exc:
+            thread_error.append(exc)
+        finally:
+            thread_ready.set()
+            try:
+                loop = api_loop_holder[0] if api_loop_holder else None
+                if loop and not loop.is_closed():
+                    loop.close()
+            except Exception:
+                pass
+
+    api_thread = threading.Thread(
+        target=_api_thread,
+        daemon=True,
+        name="openakita-api",
+    )
+    api_thread.start()
+
+    await asyncio.to_thread(thread_ready.wait)
+
+    if thread_error:
+        raise RuntimeError(f"API thread failed to start: {thread_error[0]}")
+
+    api_loop = api_loop_holder[0] if api_loop_holder else None
+
+    # ── Register loops for the cross-loop bridge ─────────────────────
+    from openakita.core.engine_bridge import set_api_loop, set_engine_loop
+
+    set_engine_loop(engine_loop)
+    if api_loop is not None:
+        set_api_loop(api_loop)
+
+    from openakita import get_version_string
+
+    logger.info(
+        f"HTTP API server starting on http://{host}:{port} "
+        f"(version: {get_version_string()}, dual-loop: {api_loop is not None})"
+    )
+
+    # ── Verify server is listening ───────────────────────────────────
+    for attempt in range(max_retries):
+        await asyncio.sleep(1.5)
+
+        if not api_thread.is_alive():
+            err = thread_error[0] if thread_error else RuntimeError("API thread died")
+            raise RuntimeError(f"HTTP API server failed to start: {err}")
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                s.connect((host, port))
+                logger.info(
+                    f"HTTP API server confirmed listening on http://{host}:{port} "
+                    f"(thread={api_thread.name})"
+                )
+                break
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            if attempt < max_retries - 1:
+                logger.debug(f"Server not yet listening (attempt {attempt + 1}), waiting...")
+                continue
+
+    # ── Proxy task — cancelling it triggers graceful shutdown ─────────
+    async def _proxy() -> None:
+        try:
+            while api_thread.is_alive():
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            logger.info("API proxy task cancelled, shutting down uvicorn...")
+            server.should_exit = True
+            await asyncio.to_thread(api_thread.join, 5.0)
+
+    proxy_task = asyncio.create_task(_proxy())
+    # Keep a handle to the app so the serve process can update late-bound
+    # runtime references such as the IM gateway after HTTP is already online.
+    proxy_task._openakita_api_app = app
+    return proxy_task
+
+
+def update_agent(app: FastAPI, agent: Any) -> None:
+    """Update the agent reference in the running app (e.g. after initialization)."""
+    app.state.agent = agent
+
+
+def update_runtime_refs(
+    api_task: asyncio.Task | None,
+    *,
+    agent: Any = None,
+    session_manager: Any = None,
+    gateway: Any = None,
+    orchestrator: Any = None,
+    agent_pool: Any = None,
+    startup_phase: str | None = None,
+    readiness: dict[str, Any] | None = None,
+) -> bool:
+    """Update runtime references on an API server started by start_api_server().
+
+    Some dependencies, especially IM channels, may intentionally start after
+    the HTTP API so desktop clients can connect early. This keeps routes that
+    read ``request.app.state`` in sync once those late dependencies are ready.
+    """
+    app = getattr(api_task, "_openakita_api_app", None) if api_task is not None else None
+    if app is None:
+        return False
+    if agent is not None:
+        app.state.agent = agent
+    if session_manager is not None:
+        app.state.session_manager = session_manager
+    if gateway is not None:
+        app.state.gateway = gateway
+    if orchestrator is not None:
+        app.state.orchestrator = orchestrator
+    if agent_pool is not None:
+        app.state.agent_pool = agent_pool
+    if startup_phase is not None:
+        app.state.startup_phase = startup_phase
+    if readiness is not None:
+        app.state.readiness = readiness
+    return True

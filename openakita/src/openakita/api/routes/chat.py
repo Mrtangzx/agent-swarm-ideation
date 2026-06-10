@@ -1,0 +1,3264 @@
+"""
+Chat route: POST /api/chat (SSE streaming)
+
+流式返回 AI 对话响应，包含思考内容、文本、工具调用、Plan 等事件。
+使用完整的 Agent 流水线（与 IM/CLI 共享 _prepare_session_context / _finalize_session）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+from typing import Any
+
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from openakita.core.confirmation_state import ConfirmationDecision, get_confirmation_store
+from openakita.core.engine_bridge import engine_stream, is_dual_loop, to_engine
+from openakita.core.security_actions import execute_controlled_action
+from openakita.core.trusted_paths import grant_session_trust
+
+from ..schemas import ChatAnswerRequest, ChatControlRequest, ChatRequest
+from .conversation_lifecycle import get_lifecycle_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _chat_startup_error_response(
+    exc: Exception,
+    *,
+    conversation_id: str,
+    request_id: str,
+    stage: str,
+) -> JSONResponse:
+    """Return a structured pre-stream error instead of FastAPI's bare 500 page."""
+    logger.exception(
+        "[Chat API] Pre-stream startup failed stage=%s conv=%s request=%s",
+        stage,
+        conversation_id,
+        request_id,
+    )
+    detail = str(exc)[:300] if str(exc) else type(exc).__name__
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "chat_startup_failed",
+            "stage": stage,
+            "conversation_id": conversation_id,
+            "request_id": request_id,
+            "retryable": True,
+            "message": "聊天服务启动本轮回复时遇到临时异常，消息没有丢失。请稍后重试，或切换一个可用的模型端点。",
+            "hint": "如果后端健康但仍反复出现，请检查模型端点网络、API Key 或当前端点是否可用。",
+            "detail": detail,
+        },
+    )
+
+
+def _chat_endpoint_names() -> set[str]:
+    """Return configured main-chat endpoint names.
+
+    Compiler/STT endpoints are intentionally excluded here: they can validate
+    API keys or support prompt compilation, but they cannot serve chat turns.
+    """
+    try:
+        from openakita.api.routes.config import _get_endpoint_manager
+
+        mgr = _get_endpoint_manager()
+        return {
+            str(ep.get("name"))
+            for ep in (mgr.list_endpoints("endpoints") or [])
+            if ep.get("name") and ep.get("enabled", True)
+        }
+    except Exception as exc:
+        logger.warning("[Chat API] Failed to inspect chat endpoints: %s", exc)
+        return set()
+
+
+def _format_controlled_action_result(
+    decision: ConfirmationDecision,
+    result: dict,
+    *,
+    original_message: str = "",
+) -> str:
+    if decision == ConfirmationDecision.CANCEL:
+        return "已取消该高风险操作，未执行任何修改。"
+    # 仅当确实有"受控执行入口"（即 result.kind ≠ controlled_action 错误）
+    # 才使用「已按确认执行受控操作」措辞。否则退化为中性提示，避免
+    # 在 result.status==error 时误导用户以为操作真的成功了。
+    if decision == ConfirmationDecision.INSPECT_ONLY:
+        prefix = "已按只查看处理"
+    elif result.get("status") == "ok":
+        prefix = "已按确认执行受控操作"
+    else:
+        prefix = "受控操作未能执行"
+    return (
+        f"{prefix}。\n\n"
+        f"原始请求：{original_message}\n\n"
+        f"结果：\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```"
+    )
+
+
+class _RiskAuthorizedReplay:
+    """Sentinel returned by ``_handle_pending_risk_answer`` when the user has
+    confirmed a high-risk action **but** the classification has no controlled
+    execution entry point (``classification.action is None``).
+
+    Caller should:
+    1. Replace the user-facing message with ``original_message``.
+    2. Continue the normal LLM flow; the agent's risk gate will detect the
+       session-level ``risk_authorized_replay`` metadata and skip re-blocking.
+    """
+
+    __slots__ = ("original_message", "confirmation_id")
+
+    def __init__(self, original_message: str, confirmation_id: str) -> None:
+        self.original_message = original_message
+        self.confirmation_id = confirmation_id
+
+
+async def _handle_pending_risk_answer(
+    *,
+    request: Request,
+    conversation_id: str,
+    answer: str,
+    as_stream: bool,
+    remember_for_session: bool = False,
+) -> JSONResponse | StreamingResponse | dict | _RiskAuthorizedReplay | None:
+    store = get_confirmation_store()
+    pending = store.get(conversation_id)
+    if pending is None:
+        return None
+
+    decision, consumed = store.consume(conversation_id, answer)
+    if decision == ConfirmationDecision.UNKNOWN or consumed is None:
+        return None
+
+    classification = dict(consumed.classification)
+    parameters = dict(classification.get("parameters") or {})
+
+    # Fix-11: 如果用户在弹窗里勾选了"本次会话内同类操作不再询问"，并且
+    # 决策是 CONFIRM/INSPECT_ONLY（即非 CANCEL），则向 session 写入一条
+    # 信任规则。仅按 operation_kind 维度记录，不绑定具体 path_pattern，
+    # 因为前端 UI 此处暂不传具体路径；保持克制 ⇒ 仅在本会话内生效。
+    if (
+        remember_for_session
+        and decision in (ConfirmationDecision.CONFIRM, ConfirmationDecision.INSPECT_ONLY)
+    ):
+        try:
+            session_manager = getattr(request.app.state, "session_manager", None)
+            if session_manager and conversation_id:
+                session = session_manager.get_session(
+                    channel="desktop",
+                    chat_id=conversation_id,
+                    user_id="desktop_user",
+                    create_if_missing=True,
+                )
+                if session:
+                    grant_session_trust(
+                        session,
+                        operation=classification.get("operation_kind"),
+                    )
+                    session_manager.persist()
+                    logger.info(
+                        "[RiskGate] Session trust granted (operation=%s, session=%s, "
+                        "confirmation=%s)",
+                        classification.get("operation_kind"),
+                        conversation_id,
+                        consumed.confirmation_id,
+                    )
+        except Exception as exc:
+            logger.warning("[Chat API] Failed to persist session trust grant: %s", exc)
+    if decision == ConfirmationDecision.CANCEL:
+        result = {"status": "cancelled", "kind": "pending_risk_confirmation"}
+    elif decision == ConfirmationDecision.INSPECT_ONLY:
+        target = classification.get("target_kind")
+        inspect_action = None
+        if target == "security_user_allowlist":
+            inspect_action = "list_security_allowlist"
+        elif target == "skill_external_allowlist":
+            inspect_action = "list_skill_external_allowlist"
+        result = execute_controlled_action(inspect_action, parameters)
+    else:
+        # CONFIRM 分支：当 classification.action is None（无受控执行入口）
+        # 时，**不要走死路径** — 改为标记会话 risk_authorized_replay，
+        # 让 LLM 重新规划原始 user 意图。详见 _RiskAuthorizedReplay 文档。
+        action = classification.get("action")
+        if not action:
+            session_manager = getattr(request.app.state, "session_manager", None)
+            if session_manager and conversation_id:
+                try:
+                    session = session_manager.get_session(
+                        channel="desktop",
+                        chat_id=conversation_id,
+                        user_id="desktop_user",
+                        create_if_missing=True,
+                    )
+                    if session:
+                        # 用户的"继续/确认"是回应高危确认弹窗的应答，并非新一轮
+                        # 真实意图（真实意图是 original_message，将在下一轮被 LLM
+                        # 重新规划）。标记 transient_for_llm 仅供 UI 展示。
+                        session.add_message("user", answer, transient_for_llm=True)
+                        # 旧字段保留向后兼容（旧 agent 路径会读它）
+                        session.set_metadata(
+                            "risk_authorized_replay",
+                            {
+                                "expires_at": time.time() + 30,
+                                "confirmation_id": consumed.confirmation_id,
+                                "original_message": consumed.original_message,
+                            },
+                        )
+                        # PR-A2：结构化授权意图，避免 LLM 自由 ReAct 全盘 grep。
+                        try:
+                            from openakita.core.feature_flags import (
+                                is_enabled as _ff_enabled,
+                            )
+                            from openakita.core.risk_intent import (
+                                derive_authorized_intent,
+                            )
+
+                            if _ff_enabled("risk_authorized_intent_v2"):
+                                _intent = derive_authorized_intent(
+                                    classification,
+                                    original_message=consumed.original_message,
+                                    confirmation_id=consumed.confirmation_id,
+                                    now=time.time(),
+                                )
+                                session.set_metadata(
+                                    "risk_authorized_intent",
+                                    _intent.to_dict(),
+                                )
+                                logger.info(
+                                    "[RiskGate] Issued AuthorizedIntent op=%s target=%s scope=%s",
+                                    _intent.operation,
+                                    _intent.target_kind,
+                                    _intent.scope,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "[Chat API] Failed to derive AuthorizedIntent: %s", exc
+                            )
+                        session_manager.persist()
+                except Exception as exc:
+                    logger.warning(
+                        "[Chat API] Failed to persist risk_authorized_replay: %s", exc
+                    )
+            logger.info(
+                "[RiskGate] User confirmed high-risk action without controlled entry — "
+                "replaying original message via LLM (session=%s, confirmation=%s)",
+                conversation_id,
+                consumed.confirmation_id,
+            )
+            return _RiskAuthorizedReplay(
+                original_message=consumed.original_message,
+                confirmation_id=consumed.confirmation_id,
+            )
+        result = execute_controlled_action(action, parameters)
+
+    try:
+        from openakita.core.security_actions import (
+            maybe_broadcast_death_switch_reset,
+            maybe_refresh_skills,
+        )
+
+        await maybe_broadcast_death_switch_reset(result)
+        await maybe_refresh_skills(result, lambda: getattr(request.app.state, "agent", None))
+    except Exception:
+        pass
+
+    response_text = _format_controlled_action_result(
+        decision,
+        result,
+        original_message=consumed.original_message,
+    )
+
+    session_manager = getattr(request.app.state, "session_manager", None)
+    if session_manager and conversation_id:
+        try:
+            session = session_manager.get_session(
+                channel="desktop",
+                chat_id=conversation_id,
+                user_id="desktop_user",
+                create_if_missing=True,
+            )
+            if session:
+                # 用户的"确认/取消"回答 + 系统的受控操作回执 都仅供 UI 历史展示，
+                # 不再喂给 LLM —— 否则下一轮 LLM 会模仿"已确认高危..."句式
+                # 或被"受控操作未能执行"措辞带偏（详见 _prepare_session_context
+                # 中 transient_for_llm 跳过逻辑）。
+                session.add_message("user", answer, transient_for_llm=True)
+                session.add_message(
+                    "assistant",
+                    response_text,
+                    transient_for_llm=True,
+                    controlled_confirmation={
+                        "decision": decision.value,
+                        "confirmation_id": consumed.confirmation_id,
+                        "result": result,
+                    },
+                )
+                session_manager.persist()
+        except Exception as exc:
+            logger.warning("[Chat API] Failed to persist controlled confirmation: %s", exc)
+
+    if not as_stream:
+        return {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "decision": decision.value,
+            "confirmation_id": consumed.confirmation_id,
+            "result": result,
+            "message": response_text,
+        }
+
+    async def _gen():
+        payload = {"type": "text_delta", "content": response_text}
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        done = {"type": "done", "controlled_confirmation": True}
+        yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/api/commands")
+async def list_commands():
+    """Return available slash commands for the Desktop UI."""
+    try:
+        from ...commands.registry import CommandScope, get_commands
+    except ImportError:
+        return []
+
+    return [
+        {
+            "name": c.name,
+            "label": c.label,
+            "description": c.description,
+            "argsHint": c.args_hint,
+        }
+        for c in get_commands()
+        if CommandScope.DESKTOP in c.scope
+    ]
+
+
+def _backfill_ask_user_answer(session, answer_text: str) -> None:
+    """Persist an ask_user answer onto the assistant message that raised it.
+
+    A user's reply to an ask_user prompt is sent as a normal follow-up message
+    (it starts a new turn). The frontend already marks the prompt answered
+    locally, but that state was never persisted, so a reload / second window
+    re-rendered the prompt as freshly clickable. ask_user ends the turn, so the
+    answer is the message immediately following the assistant turn that owns
+    the prompt — reliable within a conversation even under the per-conversation
+    busy lock. We mark only the most-recent unanswered ask_user.
+    """
+    if not answer_text:
+        return
+    try:
+        msgs = session.context.messages
+    except Exception:
+        return
+    if not msgs:
+        return
+    for m in reversed(msgs):
+        role = m.get("role")
+        if role == "user":
+            # Skip the just-added answer (and any other trailing user turns).
+            continue
+        if role == "assistant":
+            au = m.get("ask_user")
+            if isinstance(au, dict) and not au.get("answered"):
+                au["answered"] = True
+                au["answer"] = answer_text
+        # Only the immediately preceding assistant turn can own the prompt.
+        return
+
+
+@router.post("/api/chat/clear")
+async def clear_chat(request: Request):
+    """Clear session context for a conversation."""
+    body = await request.json()
+    conversation_id = body.get("conversation_id", "")
+    if not conversation_id:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "missing conversation_id"},
+        )
+
+    session_manager = getattr(request.app.state, "session_manager", None)
+    if not session_manager:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": "session manager not available"},
+        )
+
+    cleared = session_manager.clear_history(
+        channel="desktop",
+        chat_id=conversation_id,
+        user_id="desktop_user",
+    )
+    if cleared:
+        _cleanup_chat_runtime_state(request, conversation_id)
+        return {"ok": True}
+
+    # Fallback: search by Session.id (handles wrapped IDs from API clients)
+    session = session_manager.get_session_by_id(conversation_id)
+    if session:
+        session.context.clear_messages()
+        session_manager.mark_dirty()
+        _cleanup_chat_runtime_state(request, conversation_id)
+        return {"ok": True}
+
+    return JSONResponse(
+        status_code=404,
+        content={"ok": False, "error": "session not found"},
+    )
+
+
+def _cleanup_chat_runtime_state(request: Request, conversation_id: str) -> None:
+    """Clear runtime state that should not survive /api/chat/clear.
+
+    C8b-3：v1 ``pe.cleanup_session()`` 拆成两件事——
+    (1) ``UIConfirmBus.cleanup_session(sid)`` 删本会话的 pending confirms
+    (2) ``SessionAllowlistManager.clear()`` 清 session 临时白名单（v1 行为
+        也是不论 sid 全清，C8b-3 暂保持一致）
+    """
+    try:
+        from ...core.policy_v2 import get_session_allowlist_manager
+        from ...core.ui_confirm_bus import get_ui_confirm_bus
+
+        get_ui_confirm_bus().cleanup_session(conversation_id)
+        get_session_allowlist_manager().clear()
+    except Exception:
+        pass
+
+    try:
+        from ...tools.handlers.plan import clear_session_todo_state
+
+        clear_session_todo_state(conversation_id)
+    except Exception:
+        pass
+
+    # Clear pending tool confirmations in the ToolExecutor
+    try:
+        brain = getattr(request.app.state, "brain", None)
+        if brain and hasattr(brain, "_tool_executor"):
+            brain._tool_executor.clear_confirm_cache()
+    except Exception:
+        pass
+
+    try:
+        from ...prompt.builder import clear_prompt_section_cache
+
+        clear_prompt_section_cache()
+    except Exception:
+        pass
+
+    try:
+        orchestrators = []
+
+        app_orchestrator = getattr(request.app.state, "orchestrator", None)
+        if app_orchestrator is not None:
+            orchestrators.append(app_orchestrator)
+
+        try:
+            from openakita.main import _orchestrator as global_orchestrator
+
+            if global_orchestrator is not None and global_orchestrator not in orchestrators:
+                orchestrators.append(global_orchestrator)
+        except Exception:
+            pass
+
+        for orchestrator in orchestrators:
+            if hasattr(orchestrator, "purge_session_states"):
+                orchestrator.purge_session_states(conversation_id)
+    except Exception:
+        pass
+
+
+async def _broadcast_chat_event(event: str, data: dict) -> None:
+    """Broadcast a chat event via WebSocket to all connected clients."""
+    try:
+        from .websocket import broadcast_event
+
+        await broadcast_event(event, data)
+    except Exception:
+        pass
+
+
+def _extract_source_used(event: dict) -> dict | None:
+    """Extract OpenAkita source provenance from tool results.
+
+    Tool handlers prefix result text with ``[OPENAKITA_SOURCE] {json}`` so the
+    API can emit a small, stable UI event without parsing the full tool output.
+    """
+    if event.get("type") != "tool_call_end":
+        return None
+    source = event.get("source")
+    if isinstance(source, dict):
+        payload = dict(source)
+    else:
+        result = str(event.get("result", ""))
+        marker = "[OPENAKITA_SOURCE]"
+        if marker not in result:
+            return None
+        line = result[result.index(marker) + len(marker):].strip().splitlines()[0].strip()
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    payload.setdefault("tool_name", event.get("tool_name") or event.get("tool", ""))
+    payload.setdefault("tool_use_id", event.get("call_id") or event.get("id", ""))
+    payload.setdefault("requested_url", "")
+    payload.setdefault("final_url", payload.get("requested_url", ""))
+    payload.setdefault("hostname", "")
+    payload.setdefault("redirected", False)
+    payload.setdefault("from_cache", False)
+    payload.setdefault("status", "ok")
+    payload.setdefault("hint", "")
+    return payload
+
+
+def _extract_mcp_call(event: dict) -> dict | None:
+    """Extract a structured MCP call summary from a tool result.
+
+    Mirrors :func:`_extract_source_used`: ``call_mcp_tool`` results carry a
+    ``[OPENAKITA_MCP] {json}`` marker so the chat route can emit a stable
+    ``mcp_call`` SSE event without scraping prose.
+    """
+    if event.get("type") != "tool_call_end":
+        return None
+    if (event.get("tool_name") or event.get("tool", "")) != "call_mcp_tool":
+        return None
+    result = str(event.get("result", ""))
+    marker = "[OPENAKITA_MCP]"
+    if marker not in result:
+        return None
+    try:
+        line = result[result.index(marker) + len(marker):].strip().splitlines()[0].strip()
+        payload = json.loads(line)
+    except (json.JSONDecodeError, TypeError, ValueError, IndexError):
+        return None
+    payload.setdefault("tool_use_id", event.get("call_id") or event.get("id", ""))
+    payload.setdefault("server", "")
+    payload.setdefault("tool", "")
+    payload.setdefault("status", "ok")
+    payload.setdefault("auto_connected", False)
+    payload.setdefault("reconnected", False)
+    payload.setdefault("error", "")
+    return payload
+
+
+def _resolve_agent(agent: object):
+    """Resolve the actual Agent instance."""
+    from openakita.core.agent import Agent
+
+    if isinstance(agent, Agent):
+        return agent
+    return None
+
+
+def _resolve_profile(agent_profile_id: str | None):
+    """Resolve an AgentProfile by id.
+
+    解析顺序（关键修复 a4284107）：
+    1. 先尝试用户磁盘 profile —— 用户对系统预设 id 的覆写应优先生效，
+       否则用户在 UI 上修改的 prompt / endpoint 永远被同 id 的 SYSTEM_PRESET 覆盖。
+    2. 找不到再 fallback 到内置 SYSTEM_PRESETS。
+    3. 最后兜底 default 预设 / 空 AgentProfile。
+    """
+    from openakita.agents.presets import SYSTEM_PRESETS
+    from openakita.agents.profile import AgentProfile, get_profile_store
+
+    pid = agent_profile_id or "default"
+
+    try:
+        store = get_profile_store()
+        profile = store.get(pid)
+        if profile:
+            return profile
+    except Exception:
+        pass
+
+    for p in SYSTEM_PRESETS:
+        if p.id == pid:
+            return p
+
+    for p in SYSTEM_PRESETS:
+        if p.id == "default":
+            return p
+
+    return AgentProfile(id="default", name="Default Agent")
+
+
+async def _get_agent_for_session(
+    request: Request, conversation_id: str, agent_profile_id: str | None = None
+):
+    """Get a per-session Agent from pool, or fallback to global agent."""
+    pool = getattr(request.app.state, "agent_pool", None)
+    if pool is not None and conversation_id:
+        profile = _resolve_profile(agent_profile_id)
+        return await to_engine(pool.get_or_create(conversation_id, profile))
+    return getattr(request.app.state, "agent", None)
+
+
+def _get_existing_agent(request: Request, conversation_id: str | None):
+    """Get the existing Agent for a session (no creation). For control ops."""
+    pool = getattr(request.app.state, "agent_pool", None)
+    if pool is not None and conversation_id:
+        agent = pool.get_existing(conversation_id)
+        if agent is not None:
+            return agent
+    return getattr(request.app.state, "agent", None)
+
+
+def _apply_agent_profile(session: object, new_profile_id: str) -> bool:
+    """Store agent_profile_id in session context and record the switch.
+
+    Returns True if profile was applied, False if profile_id is invalid.
+    """
+    from datetime import datetime
+
+    ctx = getattr(session, "context", None)
+    if ctx is None:
+        return False
+    old_profile_id = ctx.agent_profile_id
+    if old_profile_id == new_profile_id:
+        return True
+
+    # Validate that profile exists
+    try:
+        from openakita.agents.presets import SYSTEM_PRESETS
+        from openakita.agents.profile import get_profile_store
+
+        known_ids = {p.id for p in SYSTEM_PRESETS}
+        if new_profile_id not in known_ids:
+            store = get_profile_store()
+            if store.get(new_profile_id) is None:
+                logger.warning(f"[Chat API] Unknown agent profile: {new_profile_id!r}")
+                return False
+    except Exception:
+        pass  # graceful fallback — allow switch if validation infra unavailable
+
+    ctx.agent_switch_history.append(
+        {
+            "from": old_profile_id,
+            "to": new_profile_id,
+            "at": datetime.now().isoformat(),
+        }
+    )
+    ctx.agent_profile_id = new_profile_id
+    logger.info(f"[Chat API] Agent profile switched: {old_profile_id!r} -> {new_profile_id!r}")
+    return True
+
+
+def _schedule_background_save(
+    agent_task: asyncio.Task,
+    agent_done: asyncio.Event,
+    agent_queue: asyncio.Queue,
+    sse_fn,
+    session,
+    session_manager,
+    conversation_id: str,
+    full_reply_snapshot: str,
+    collected_artifacts: list,
+    save_done: bool,
+) -> None:
+    """Register a background callback so that when a long-running agent task
+    finally completes after the SSE stream has closed, the result is still
+    saved to the session.  The user will see it when they refresh the page."""
+
+    async def _bg_drain_and_save():
+        try:
+            await agent_done.wait()
+        except Exception:
+            return
+
+        bg_reply = full_reply_snapshot
+        bg_artifacts = list(collected_artifacts)
+        try:
+            while not agent_queue.empty():
+                ev = agent_queue.get_nowait()
+                if ev is None or ev.get("type") == "__agent_error__":
+                    break
+                et = ev.get("type", "")
+                if et == "text_delta" and "content" in ev:
+                    bg_reply += ev["content"]
+                elif et == "text_replace" and "content" in ev:
+                    bg_reply = ev["content"]
+        except Exception:
+            pass
+
+        if session and bg_reply and not save_done:
+            try:
+                meta: dict = {}
+                if bg_artifacts:
+                    meta["artifacts"] = bg_artifacts
+                session.add_message("assistant", bg_reply, **meta)
+                if session_manager:
+                    session_manager.persist()
+                logger.info(
+                    "[Chat API] Background save: %d chars (conv=%s)",
+                    len(bg_reply),
+                    conversation_id,
+                )
+            except Exception as e:
+                logger.warning("[Chat API] Background save failed: %s", e)
+
+        if conversation_id:
+            try:
+                await get_lifecycle_manager().finish(conversation_id)
+            except Exception:
+                pass
+
+    asyncio.create_task(_bg_drain_and_save())
+    logger.info(
+        "[Chat API] Scheduled background save for long-running task (conv=%s)",
+        conversation_id,
+    )
+
+
+async def _stream_chat(
+    chat_request: ChatRequest,
+    agent: object,
+    session_manager: object | None = None,
+    http_request: Request | None = None,
+    busy_generation: int = 0,
+    request_id: str = "",
+    requested_mode: str = "",
+) -> AsyncIterator[str]:
+    """Generate SSE events via Agent.chat_with_session_stream().
+
+    这是一个瘦 SSE 传输层，核心逻辑全部委托给 Agent 流水线。
+    只负责：
+    - SSE 格式包装
+    - 客户端断开检测
+    - artifact 事件注入（deliver_artifacts）
+    - ask_user 文本捕获
+    - Session 回复保存
+    """
+
+    _reply_chars = 0
+    _reply_preview = ""
+    _full_reply = ""  # 完整回复文本（用于 session 保存）
+    _chain_reply = ""  # chain_text 累积（仅在无 text_delta 时 fallback 使用）
+    _done_sent = False
+    _client_disconnected = False
+    _ask_user_question = ""
+    _ask_user_options: list[dict] = []
+    _ask_user_questions: list[dict] = []
+    _collected_artifacts: list[dict] = []
+    # Latest plan snapshot observed on the SSE stream this turn. Captured here
+    # (mirroring the frontend's ``currentPlan``) so the *final* state survives —
+    # ``auto_close_todo`` unregisters the plan before the assistant message is
+    # saved, so a save-time registry lookup would miss completed plans (#615).
+    _last_todo_snapshot: dict | None = None
+    # Server-side mirror of the browser's reasoning-chain assembly. Built from
+    # the same SSE events so the persisted history can restore the causal
+    # timeline (thinking / narration / tool args / results, in order) instead of
+    # the lossy chain_summary on cross-window / cross-device reload.
+    from ..chain_timeline import ChainTimelineBuilder
+
+    _chain_timeline_builder = ChainTimelineBuilder()
+
+    async def _check_disconnected() -> bool:
+        nonlocal _client_disconnected
+        if _client_disconnected:
+            return True
+        if http_request is not None:
+            try:
+                if await http_request.is_disconnected():
+                    _client_disconnected = True
+                    logger.info("[Chat API] 客户端已断开连接，停止流式输出")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # ── C17 Phase B.1/B.2: SSE replay session ──
+    # 每个 conversation_id 对应一个 SSESession（per-session ringbuffer +
+    # 单调 seq）。客户端断线后 ``fetch /api/chat`` 带 ``Last-Event-ID``
+    # header 时，我们先 flush ringbuffer 里 seq > last_seq 的事件再接
+    # active 流。新连接（没带 Last-Event-ID）则 seq 从已有计数继续累加，
+    # 客户端要么从 0 开始接（首次 fetch），要么自己处理 dedup。
+    # 注意：``conversation_id`` 在下方 try 块里才会被赋值（包含 uuid 补全
+    # 逻辑），这里直接读 ``chat_request.conversation_id``——足够当 session
+    # key；如果用户传空字符串就降级回不带 replay 的旧行为。
+    from ...core.sse_replay import (
+        format_sse_frame,
+        parse_last_event_id,
+    )
+    from ...core.sse_replay import (
+        get_registry as _get_sse_registry,
+    )
+
+    _sse_conv_key = chat_request.conversation_id or ""
+    _sse_session = (
+        _get_sse_registry().get_or_create(_sse_conv_key)
+        if _sse_conv_key
+        else None
+    )
+
+    _last_event_id_header = None
+    if http_request is not None:
+        try:
+            _last_event_id_header = http_request.headers.get("last-event-id")
+        except Exception:
+            _last_event_id_header = None
+    _last_event_id = parse_last_event_id(_last_event_id_header)
+
+    def _sse(event_type: str, data: dict | None = None) -> str:
+        nonlocal _reply_chars, _reply_preview, _full_reply, _chain_reply, _done_sent
+        if event_type == "done":
+            if _done_sent:
+                return ""
+            _done_sent = True
+            preview = _reply_preview[:100].replace("\n", " ")
+            try:
+                logger.info(
+                    f"[Chat API] 回复完成: {_reply_chars}字 | "
+                    f'"{preview}{"..." if _reply_chars > 100 else ""}"'
+                )
+            except (UnicodeEncodeError, OSError):
+                pass
+        from ...events import normalize_stream_event
+
+        payload = normalize_stream_event({"type": event_type, **(data or {})})
+        if event_type == "text_delta" and data and "content" in data:
+            chunk = data["content"]
+            _reply_chars += len(chunk)
+            _full_reply += chunk
+            if len(_reply_preview) < 120:
+                _reply_preview += chunk
+        elif event_type == "text_replace" and data and "content" in data:
+            _full_reply = data["content"]
+            _reply_chars = len(_full_reply)
+            _reply_preview = _full_reply[:120]
+        elif event_type == "chain_text" and data and "content" in data:
+            chunk = data["content"]
+            _reply_chars += len(chunk)
+            _chain_reply += chunk
+        data_json = json.dumps(payload, ensure_ascii=False)
+        # When the SSE session is bound, record the event into the
+        # ringbuffer and emit an ``id: <seq>`` line so Last-Event-ID
+        # replay works after disconnect. Without a session (no
+        # conversation_id), fall back to the legacy frame so the existing
+        # contract holds.
+        if _sse_session is not None:
+            evt = _sse_session.add_event(event_type, payload)
+            return format_sse_frame(evt, data_json=data_json)
+        return f"data: {data_json}\n\n"
+
+    _disconnect_watcher_task: asyncio.Task | None = None
+    _agent_task: asyncio.Task | None = None
+    _agent_done = asyncio.Event()
+    _agent_queue: asyncio.Queue = asyncio.Queue()
+    _save_done = False
+    session = None
+    conversation_id = chat_request.conversation_id or ""
+
+    try:
+        # ── C17 Phase B.2: replay buffered events for reconnecting clients ──
+        # When the client sets ``Last-Event-ID``, flush ringbuffer events
+        # with ``seq > last_seq`` **before** anything new. These frames
+        # carry their original seq so the client can dedup based on
+        # ``seenSequenceNums``; we don't push them back into the buffer
+        # (they're already there) and don't bump _reply_chars / preview
+        # (those state vars only reflect the *new* turn we're about to
+        # generate).
+        if _sse_session is not None and _last_event_id is not None:
+            _missed = _sse_session.replay_from(_last_event_id)
+            if _missed:
+                logger.info(
+                    "[Chat API] replaying %d SSE event(s) for conv=%s after "
+                    "Last-Event-ID=%s",
+                    len(_missed),
+                    conversation_id,
+                    _last_event_id,
+                )
+                for evt in _missed:
+                    yield format_sse_frame(
+                        evt, data_json=json.dumps(evt.payload, ensure_ascii=False)
+                    )
+
+        # Yield an SSE comment keepalive before Agent resolution.
+        # Agent lazy-init (Brain/tools/memory/prompt) can take several
+        # seconds on cold start; sending an SSE comment immediately
+        # opens the HTTP chunked response so the client's fetch stream
+        # is activated and won't be treated as an empty response.
+        yield ":keepalive\n\n"
+
+        actual_agent = _resolve_agent(agent)
+        if actual_agent is None:
+            yield _sse("error", {"message": "Agent not initialized"})
+            yield _sse("done")
+            return
+
+        brain = actual_agent.brain
+        if brain is None:
+            yield _sse("error", {"message": "Agent brain not initialized"})
+            yield _sse("done")
+            return
+
+        # Ensure agent is initialized
+        if not actual_agent._initialized:
+            await actual_agent.initialize()
+
+        # --- Session management ---
+        import uuid as _uuid
+
+        conversation_id = chat_request.conversation_id or f"api_{_uuid.uuid4().hex[:12]}"
+        turn_id = f"{conversation_id}:{request_id or _uuid.uuid4().hex[:12]}"
+        session_messages_history: list[dict] = []
+
+        if session_manager and conversation_id:
+            try:
+                session = session_manager.get_session(
+                    channel="desktop",
+                    chat_id=conversation_id,
+                    user_id="desktop_user",
+                    create_if_missing=True,
+                )
+                if session:
+                    # C14 re-audit (D2): make the entry classifier the single
+                    # source of truth for **all** sessions, even attended SSE
+                    # ones. For ``channel="desktop"`` classifier returns
+                    # ``is_unattended=False`` and the idempotent helper is a
+                    # behavioral no-op — but it future-proofs the path: if a
+                    # later subroutine flips the session to unattended,
+                    # downstream policy will see consistent flags.
+                    try:
+                        from openakita.core.policy_v2 import (
+                            apply_classification_to_session as _apply_cls,
+                        )
+                        from openakita.core.policy_v2 import (
+                            classify_entry as _classify,
+                        )
+
+                        _apply_cls(session, _classify("desktop"))
+                    except Exception:
+                        pass
+
+                    if chat_request.agent_profile_id:
+                        _apply_agent_profile(session, chat_request.agent_profile_id)
+                    session.set_metadata("selected_endpoint", chat_request.endpoint or "")
+                    session.set_metadata("endpoint_policy", chat_request.endpoint_policy or "prefer")
+                    session.set_metadata(
+                        "ui_org_state",
+                        {
+                            "orgMode": bool(chat_request.org_mode and chat_request.org_id),
+                            "orgId": chat_request.org_id or "",
+                            "orgNodeId": chat_request.org_node_id or "",
+                        },
+                    )
+
+                    if chat_request.message:
+                        session.add_message("user", chat_request.message)
+                        _backfill_ask_user_answer(session, chat_request.message)
+                    session_messages_history = (
+                        list(session.context.messages) if hasattr(session, "context") else []
+                    )
+                    session_manager.mark_dirty()
+            except Exception as e:
+                logger.warning(f"[Chat API] Session management error: {e}")
+
+        from openakita.core.policy_v2 import DeferredApprovalRequired
+
+        # ── Background agent task: decoupled from SSE lifecycle ──
+        async def _agent_runner():
+            try:
+                async for ev in actual_agent.chat_with_session_stream(
+                    message=chat_request.message or "",
+                    session_messages=session_messages_history,
+                    session_id=conversation_id,
+                    session=session,
+                    gateway=None,
+                    plan_mode=chat_request.plan_mode,
+                    mode=chat_request.mode,
+                    endpoint_override=chat_request.endpoint,
+                    endpoint_policy=chat_request.endpoint_policy,
+                    attachments=chat_request.attachments,
+                    thinking_mode=chat_request.thinking_mode,
+                    thinking_depth=chat_request.thinking_depth,
+                    request_id=request_id,
+                    turn_id=turn_id,
+                ):
+                    await _agent_queue.put(ev)
+            except DeferredApprovalRequired as exc:
+                approval_id = exc.pending_id or ""
+                await _agent_queue.put(
+                    {
+                        "type": "pending_approval",
+                        "status": "pending_approval",
+                        "approval_id": approval_id,
+                        "approval_url": (
+                            f"/api/pending_approvals/{approval_id}" if approval_id else None
+                        ),
+                        "resolve_url": (
+                            f"/api/pending_approvals/{approval_id}/resolve"
+                            if approval_id
+                            else None
+                        ),
+                        "unattended_strategy": exc.unattended_strategy,
+                        "message": str(exc),
+                    }
+                )
+            except Exception as exc:
+                await _agent_queue.put({"type": "__agent_error__", "__exc_msg__": str(exc)[:500]})
+            finally:
+                await _agent_queue.put(None)
+                _agent_done.set()
+
+        _agent_task = asyncio.create_task(_agent_runner())
+
+        # --- 后台断连检测：宽限期机制 ---
+        # 长任务（如 multi-agent 委派）可能运行 10-20 分钟。客户端断连后不立即
+        # 取消任务，而是给予较长的宽限期（DISCONNECT_GRACE_SECONDS）。任务完成后
+        # 通过 _schedule_background_save 保存结果到 session，用户刷新即可看到。
+        DISCONNECT_GRACE_SECONDS = 900  # 15 分钟
+
+        async def _disconnect_watcher():
+            nonlocal _client_disconnected
+            while True:
+                await asyncio.sleep(2.0)
+                if _client_disconnected:
+                    break
+                if http_request is not None:
+                    try:
+                        if await http_request.is_disconnected():
+                            _client_disconnected = True
+                            logger.info(
+                                "[Chat API] 客户端断开，进入宽限期（%ds）",
+                                DISCONNECT_GRACE_SECONDS,
+                            )
+                            try:
+                                await asyncio.wait_for(
+                                    _agent_done.wait(),
+                                    timeout=DISCONNECT_GRACE_SECONDS,
+                                )
+                                logger.info("[Chat API] Agent task 在宽限期内完成")
+                            except TimeoutError:
+                                logger.warning(
+                                    "[Chat API] 宽限期超时（%ds），取消任务",
+                                    DISCONNECT_GRACE_SECONDS,
+                                )
+                                try:
+                                    actual_agent.cancel_current_task(
+                                        "客户端断开连接（宽限期后）",
+                                        session_id=conversation_id,
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"[Chat API] 断连 cancel 失败: {e}")
+                            break
+                    except Exception:
+                        break
+
+        _disconnect_watcher_task = asyncio.create_task(_disconnect_watcher())
+
+        # --- 主 SSE 事件循环：从 queue 读取事件并转发 ---
+        # v1.27.15 P0-2: every `text_delta` / `thinking_delta` / `chain_text`
+        # used to round-trip as its own HTTP chunk, saturating the React
+        # bubble-renderer on long contexts ("字一个一个慢慢出" 用户反馈).
+        # We now coalesce these high-frequency deltas through a 50ms /
+        # 2000-char window before emitting (DeltaCoalescer).  Non-delta
+        # events (tool_call_*, ask_user, artifact, ...) bypass the
+        # coalescer and remain on the low-latency path; arrival of any
+        # non-delta event also flushes pending deltas first so ordering
+        # is preserved end-to-end.
+        from ...core.sse_throttle import DeltaCoalescer
+
+        coalescer = DeltaCoalescer()
+
+        # Keepalive: 15s of true silence still needs a comment ping so
+        # nginx / cloudflare / corp proxies don't drop the SSE socket
+        # for being idle.  We can no longer use the agent_queue wait
+        # timeout for this — the coalescer needs us to tick the loop
+        # roughly every 50ms — so track elapsed-since-last-emit
+        # independently.
+        SSE_KEEPALIVE_INTERVAL = 15.0
+        COALESCER_TICK_INTERVAL = 0.05
+        _last_emit_ts = time.time()
+        _agent_errored = False
+        _agent_error_msg = ""
+
+        def _emit_via_coalescer(
+            etype: str, edata: dict | None
+        ) -> list[str]:
+            """Push one upstream event through the coalescer.
+
+            Returns the (possibly empty) list of fully-formed SSE
+            frames to ``yield``.  ``_sse`` is called once per merged
+            event so ``_full_reply`` / ``_reply_chars`` / replay
+            ringbuffer all see the post-merge content (their semantics
+            are unchanged — the merged event is functionally identical
+            to the sum of its parts).
+            """
+            out: list[str] = []
+            for et, ed in coalescer.offer(etype, edata or {}):
+                out.append(_sse(et, ed))
+            return out
+
+        def _tick_coalescer() -> list[str]:
+            """Flush any time-window-due bucket without taking new input."""
+            out: list[str] = []
+            for et, ed in coalescer.tick():
+                out.append(_sse(et, ed))
+            return out
+
+        def _drain_coalescer() -> list[str]:
+            out: list[str] = []
+            for et, ed in coalescer.drain():
+                out.append(_sse(et, ed))
+            return out
+
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    _agent_queue.get(), timeout=COALESCER_TICK_INTERVAL
+                )
+            except TimeoutError:
+                # No new event in the last 50ms.  Two responsibilities:
+                # 1) Flush any time-window-due coalescer buckets.
+                # 2) If we're approaching the 15s keepalive deadline,
+                #    emit a heartbeat to keep proxies happy.
+                _is_conn = not _client_disconnected and not await _check_disconnected()
+                if _is_conn:
+                    for line in _tick_coalescer():
+                        if line:
+                            _last_emit_ts = time.time()
+                            yield line
+                    if time.time() - _last_emit_ts >= SSE_KEEPALIVE_INTERVAL:
+                        yield _sse("heartbeat", {"ts": time.time()})
+                        _last_emit_ts = time.time()
+                continue
+            if event is None:
+                break
+
+            event_type = event.get("type", "")
+
+            # Observe every raw event (before coalescing / disconnect gating) so
+            # the persisted timeline is complete regardless of wire state.
+            _chain_timeline_builder.observe(event)
+
+            if event_type == "__agent_error__":
+                _agent_errored = True
+                _agent_error_msg = event.get("__exc_msg__") or "Unknown error"
+                if not _client_disconnected:
+                    # Flush any buffered deltas before the error so the
+                    # user sees as much of the partial answer as possible.
+                    for line in _drain_coalescer():
+                        if line:
+                            yield line
+                    yield _sse("error", {"message": _agent_error_msg, "is_truncated": True})
+                    yield _sse("done")
+                break
+
+            # 拦截 done 事件：不在此处转发，等 usage 收集完毕后统一发送
+            if event_type == "done":
+                # ensure any pending deltas get out before we hold done
+                if not _client_disconnected:
+                    for line in _drain_coalescer():
+                        if line:
+                            _last_emit_ts = time.time()
+                            yield line
+                continue
+
+            # 捕获 ask_user 问题文本和选项（用于 session 保存）
+            if event_type == "ask_user":
+                _ask_user_question = event.get("question", "")
+                _ask_user_options = event.get("options", [])
+                _ask_user_questions = event.get("questions", [])
+
+            # Push the event through the coalescer.  For non-delta types
+            # it bypasses immediately (potentially preceded by pending
+            # delta flushes); for delta types it may be buffered.
+            event_data = {k: v for k, v in event.items() if k != "type"}
+            _emitted = _emit_via_coalescer(event_type, event_data)
+
+            # Client disconnected — text is accumulated by _sse above
+            # (which we still call via the coalescer), skip wire output.
+            _is_connected = not _client_disconnected
+            if _is_connected and not await _check_disconnected():
+                for line in _emitted:
+                    if line:
+                        _last_emit_ts = time.time()
+                        yield line
+            else:
+                continue
+
+            _source_used = _extract_source_used(event)
+            if _source_used:
+                try:
+                    actual_agent._last_link_diagnostic = dict(_source_used)
+                    if http_request is not None:
+                        http_request.app.state.last_link_diagnostic = dict(_source_used)
+                except Exception:
+                    pass
+                # FIX-F (post-S2 audit): these direct-yield paths bypass
+                # the coalescer, so we need to update _last_emit_ts
+                # ourselves or the heartbeat watchdog will think the
+                # stream has been silent and emit spurious pings.
+                yield _sse("source_used", _source_used)
+                _last_emit_ts = time.time()
+
+            _mcp_call = _extract_mcp_call(event)
+            if _mcp_call:
+                yield _sse("mcp_call", _mcp_call)
+                _last_emit_ts = time.time()
+
+            # Track the plan as it streams so we can persist the final snapshot
+            # onto the assistant message (the registry is cleared by auto-close
+            # before the save runs). Mirrors ChatView's currentPlan assembly.
+            if event_type == "todo_created":
+                _plan_evt = event.get("plan")
+                if isinstance(_plan_evt, dict):
+                    import copy as _copy
+
+                    _last_todo_snapshot = _copy.deepcopy(_plan_evt)
+            elif event_type == "todo_step_updated" and isinstance(_last_todo_snapshot, dict):
+                _step_id = event.get("stepId") or event.get("step_id")
+                _step_idx = event.get("stepIdx")
+                _new_status = event.get("status")
+                _steps = _last_todo_snapshot.get("steps") or []
+                for _i, _s in enumerate(_steps):
+                    if (_step_id and _s.get("id") == _step_id) or (
+                        isinstance(_step_idx, int) and _i == _step_idx
+                    ):
+                        if _new_status:
+                            _s["status"] = _new_status
+                        break
+            elif event_type == "todo_completed" and isinstance(_last_todo_snapshot, dict):
+                _last_todo_snapshot["status"] = "completed"
+            elif event_type == "todo_cancelled" and isinstance(_last_todo_snapshot, dict):
+                _last_todo_snapshot["status"] = "cancelled"
+
+            # deliver_artifacts / send_sticker 都可能返回带 receipts 的 JSON
+            _artifact_tools = ("deliver_artifacts", "send_sticker")
+            if event_type == "tool_call_end" and event.get("tool") in _artifact_tools:
+                try:
+                    result_str = event.get("result", "{}")
+                    _log_marker = "\n\n[执行日志]"
+                    if _log_marker in result_str:
+                        result_str = result_str[: result_str.index(_log_marker)]
+                    result_data = json.loads(result_str)
+                    _receipts = result_data.get("receipts", [])
+                    _emitted = 0
+                    for receipt in _receipts:
+                        if receipt.get("status") == "delivered" and receipt.get("file_url"):
+                            art_data = {
+                                "artifact_type": receipt.get("type", "file"),
+                                "file_url": receipt["file_url"],
+                                "path": receipt.get("path", ""),
+                                "name": receipt.get("name", ""),
+                                "caption": receipt.get("caption", ""),
+                                "size": receipt.get("size"),
+                            }
+                            _collected_artifacts.append(art_data)
+                            yield _sse("artifact", art_data)
+                            _last_emit_ts = time.time()
+                            _emitted += 1
+                    logger.info(
+                        f"[Chat API] Artifact SSE: tool={event.get('tool')}, "
+                        f"receipts={len(_receipts)}, emitted={_emitted}"
+                    )
+                except (json.JSONDecodeError, TypeError, KeyError) as exc:
+                    logger.warning(
+                        f"[Chat API] Artifact parse failed for {event.get('tool')}: {exc!r}, "
+                        f"result preview: {str(event.get('result', ''))[:200]}"
+                    )
+
+            # Forward artifact receipts from sub-agents (via orchestrator delegation).
+            # delegate_parallel may contain multiple __ARTIFACT_RECEIPTS__ blocks.
+            _delegation_tools = ("delegate_to_agent", "delegate_parallel", "spawn_agent")
+            if event_type == "tool_call_end" and event.get("tool") in _delegation_tools:
+                _art_marker = "__ARTIFACT_RECEIPTS__\n"
+                _del_result = event.get("result", "")
+                _search_pos = 0
+                _del_emitted = 0
+                while _art_marker in _del_result[_search_pos:]:
+                    try:
+                        _idx = _del_result.index(_art_marker, _search_pos) + len(_art_marker)
+                        _eol = _del_result.find("\n", _idx)
+                        _chunk = _del_result[_idx:] if _eol < 0 else _del_result[_idx:_eol]
+                        _search_pos = _idx + len(_chunk)
+                        for receipt in json.loads(_chunk):
+                            if isinstance(receipt, dict) and receipt.get("file_url"):
+                                art_data = {
+                                    "artifact_type": receipt.get("type", "file"),
+                                    "file_url": receipt["file_url"],
+                                    "path": receipt.get("path", ""),
+                                    "name": receipt.get("name", ""),
+                                    "caption": receipt.get("caption", ""),
+                                    "size": receipt.get("size"),
+                                }
+                                _collected_artifacts.append(art_data)
+                                yield _sse("artifact", art_data)
+                                _last_emit_ts = time.time()
+                                _del_emitted += 1
+                    except (json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
+                        logger.warning(
+                            f"[Chat API] Delegation artifact parse failed: {exc!r}, "
+                            f"chunk preview: {_del_result[max(0, _search_pos - 50) : _search_pos + 100]}"
+                        )
+                        break
+                if _art_marker in _del_result:
+                    logger.info(
+                        f"[Chat API] Delegation artifact SSE: tool={event.get('tool')}, "
+                        f"emitted={_del_emitted}"
+                    )
+
+            # Inject ui_preference events for system_config set_ui results
+            if event_type == "tool_call_end" and event.get("tool") == "system_config":
+                try:
+                    result_str = event.get("result", "")
+                    if '"ui_preference"' in result_str:
+                        _log_marker = "\n\n[执行日志]"
+                        if _log_marker in result_str:
+                            result_str = result_str[: result_str.index(_log_marker)]
+                        result_data = json.loads(result_str)
+                        ui_pref = result_data.get("ui_preference")
+                        if ui_pref:
+                            yield _sse("ui_preference", ui_pref)
+                            _last_emit_ts = time.time()
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+
+        # --- Save assistant response to session ---
+        _save_done = True
+
+        # Collect usage once and reuse the same payload for SSE and session history.
+        # Missing provider usage must not be persisted as a real-looking zero.
+        _usage_data: dict | None = None
+        try:
+            _cached = getattr(actual_agent, "_last_usage_summary", None)
+            if _cached:
+                _usage_data = dict(_cached)
+            else:
+                re = getattr(actual_agent, "reasoning_engine", None)
+                trace = getattr(actual_agent, "_last_finalized_trace", None) or (
+                    getattr(re, "_last_react_trace", []) if re else []
+                )
+                if trace:
+                    total_in = sum(t.get("tokens", {}).get("input", 0) for t in trace)
+                    total_out = sum(t.get("tokens", {}).get("output", 0) for t in trace)
+                    if total_in or total_out:
+                        usage_estimated = any(bool(t.get("usage_estimated")) for t in trace)
+                        usage_sources = {
+                            str(t.get("usage_source"))
+                            for t in trace
+                            if str(t.get("usage_source") or "").strip()
+                        }
+                        _usage_data = {
+                            "input_tokens": total_in,
+                            "output_tokens": total_out,
+                            "total_tokens": total_in + total_out,
+                        }
+                        if usage_estimated:
+                            _usage_data["usage_estimated"] = True
+                        else:
+                            # Fix-13: 双写新字段名，前端可逐步切换。
+                            _usage_data["billable_input_tokens"] = total_in
+                            _usage_data["billable_output_tokens"] = total_out
+                            _usage_data["billable_total_tokens"] = total_in + total_out
+                        if usage_sources:
+                            _usage_data["usage_source"] = (
+                                "mixed" if len(usage_sources) > 1 else next(iter(usage_sources))
+                            )
+                ctx_mgr = getattr(actual_agent, "context_manager", None) or getattr(
+                    re, "_context_manager", None
+                )
+                if ctx_mgr and hasattr(ctx_mgr, "get_max_context_tokens"):
+                    _max_ctx = ctx_mgr.get_max_context_tokens()
+                    _msgs = getattr(re, "_last_working_messages", None) or getattr(
+                        getattr(actual_agent, "_context", None), "messages", []
+                    )
+                    _cur_ctx = ctx_mgr.estimate_messages_tokens(_msgs) if _msgs else 0
+                    if _usage_data is None:
+                        _usage_data = {}
+                    _usage_data["context_tokens"] = _cur_ctx
+                    _usage_data["context_limit"] = _max_ctx
+                    _usage_data["history_context_tokens"] = _cur_ctx
+                    _usage_data["history_context_limit"] = _max_ctx
+                # 透出 ContextPressure 摘要 — 供前端"上下文健康度"展示。
+                # 已由 reasoning_engine 在每轮 token 异常检测时同步刷新，
+                # 此处直接读取，零额外计算。
+                _last_pressure = getattr(re, "_last_context_pressure", None)
+                if _last_pressure:
+                    if _usage_data is None:
+                        _usage_data = {}
+                    _usage_data["context_pressure"] = dict(_last_pressure)
+        except Exception:
+            pass
+
+        # ask_user 场景：_ask_user_question 已包含 LLM 文本 + 问题（由 reason_stream 拼接），
+        # 优先使用它作为保存文本，确保下一轮 LLM 能看到完整的确认问题上下文。
+        if _ask_user_question or _ask_user_questions:
+            parts = []
+            if _ask_user_question:
+                parts.append(_ask_user_question)
+            if _ask_user_questions:
+                for q in _ask_user_questions:
+                    q_prompt = q.get("prompt", "")
+                    q_opts = q.get("options", [])
+                    if q_prompt:
+                        parts.append(f"\n{q_prompt}")
+                    if q_opts:
+                        for o in q_opts:
+                            parts.append(f"  - {o.get('id', '')}: {o.get('label', '')}")
+            elif _ask_user_options:
+                parts.append("\n选项：")
+                for o in _ask_user_options:
+                    parts.append(f"  - {o.get('id', '')}: {o.get('label', '')}")
+            ask_text = "\n".join(parts)
+            assistant_text_to_save = ask_text if ask_text.strip() else (_full_reply or _chain_reply)
+        else:
+            assistant_text_to_save = _full_reply or _chain_reply
+
+        # Collect tool execution summary as structured metadata
+        _tool_summary = None
+        try:
+            _tool_summary = actual_agent.build_tool_trace_summary() or None
+            if _tool_summary:
+                logger.debug(f"[Chat API] Tool trace summary ({len(_tool_summary)} chars)")
+        except Exception:
+            pass
+
+        _chain_summary = None
+        if session:
+            try:
+                _chain_summary = session.get_metadata("_last_chain_summary")
+                session.set_metadata("_last_chain_summary", None)
+            except Exception:
+                pass
+
+        if not assistant_text_to_save:
+            _task = (
+                actual_agent.agent_state.current_task
+                if hasattr(actual_agent, "agent_state") and actual_agent.agent_state
+                else None
+            )
+            if _task and _task.cancelled:
+                assistant_text_to_save = "[任务已取消]"
+
+        if session and assistant_text_to_save:
+            try:
+                _msg_meta: dict = {}
+                if _chain_summary:
+                    _msg_meta["chain_summary"] = _chain_summary
+                _chain_timeline = _chain_timeline_builder.build()
+                if _chain_timeline:
+                    _msg_meta["chain_timeline"] = _chain_timeline
+                if _tool_summary:
+                    _msg_meta["tool_summary"] = _tool_summary
+                if _collected_artifacts:
+                    _msg_meta["artifacts"] = _collected_artifacts
+                if _usage_data and (
+                    _usage_data.get("input_tokens") or _usage_data.get("output_tokens")
+                ):
+                    _msg_meta["usage"] = _usage_data
+                if _ask_user_question:
+                    _ask_user_data: dict = {"question": _ask_user_question}
+                    if _ask_user_options:
+                        _ask_user_data["options"] = _ask_user_options
+                    if _ask_user_questions:
+                        _ask_user_data["questions"] = _ask_user_questions
+                    _msg_meta["ask_user"] = _ask_user_data
+                # Snapshot the plan onto the assistant message so the plan card
+                # survives reload / multi-window switch (#615). Prefer the
+                # snapshot captured from the live SSE stream (which retains the
+                # *final* state even after auto_close unregisters the plan);
+                # fall back to the registry for an in-progress plan that emitted
+                # no events this turn. The shape matches the ``todo_created`` SSE.
+                try:
+                    from ..message_parts import serialize_plan_to_chat_todo
+
+                    _todo_snapshot = None
+                    if isinstance(_last_todo_snapshot, dict):
+                        _todo_snapshot = serialize_plan_to_chat_todo(_last_todo_snapshot)
+                    if not (_todo_snapshot and _todo_snapshot.get("steps")):
+                        from ...tools.handlers.plan import (
+                            get_todo_handler_for_session,
+                            has_active_todo,
+                        )
+
+                        if conversation_id and has_active_todo(conversation_id):
+                            _todo_handler = get_todo_handler_for_session(conversation_id)
+                            _todo_plan = (
+                                _todo_handler.get_plan_for(conversation_id)
+                                if _todo_handler
+                                else None
+                            )
+                            _todo_snapshot = serialize_plan_to_chat_todo(_todo_plan)
+                    if _todo_snapshot and _todo_snapshot.get("steps"):
+                        _msg_meta["todo"] = _todo_snapshot
+                except Exception:
+                    pass
+                if _agent_errored:
+                    _msg_meta["is_truncated"] = True
+                    _msg_meta["truncation_reason"] = "mid_stream_failure"
+                    _msg_meta["stream_error"] = _agent_error_msg
+                session.add_message("assistant", assistant_text_to_save, **_msg_meta)
+                if session_manager:
+                    session_manager.persist()
+            except Exception as e:
+                logger.error(
+                    f"[Chat API] Failed to save assistant message to session: {e}", exc_info=True
+                )
+
+        # Ensure sub-agent records are flushed to disk
+        if session and hasattr(session, "context") and session_manager:
+            if getattr(session.context, "sub_agent_records", None):
+                session_manager.mark_dirty()
+
+        if not _client_disconnected and not _agent_errored:
+            # P0-2: ensure any final pending deltas are flushed before
+            # we send the terminating ``done`` — otherwise the last few
+            # tens of characters of the answer can race the done frame
+            # and be dropped by a strict client.
+            for _final_line in _drain_coalescer():
+                if _final_line:
+                    yield _final_line
+            # 透传本轮真实生效的 mode（IntentAnalyzer 可能把 CHAT 类闲聊静默
+            # 降级为 ask），让前端能识别"用户传 agent 但被降为 ask"的场景。
+            _eff_mode = getattr(actual_agent, "_last_effective_mode", None) or chat_request.mode
+            yield _sse("done", {
+                "usage": _usage_data,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "effective_mode": _eff_mode,
+                "requested_mode": requested_mode or chat_request.mode,
+                "tool_policy_source": getattr(actual_agent, "_last_tool_policy_source", "mode_ruleset"),
+            })
+
+    except Exception as e:
+        logger.error(f"Chat stream error: {e}", exc_info=True)
+        if not _client_disconnected:
+            # Flush remaining deltas so the user sees as much of the
+            # partial answer as possible before the error frame.
+            try:
+                for _err_line in _drain_coalescer():
+                    if _err_line:
+                        yield _err_line
+            except Exception:
+                pass
+            err_msg = str(e)[:500] or f"{type(e).__name__}: unknown error"
+            yield _sse("error", {"message": err_msg})
+            yield _sse("done")
+    finally:
+        # ── Wait for agent task to finish (deferred save if SSE gen was interrupted) ──
+        _bg_save_scheduled = False
+        if _agent_task is not None and not _agent_done.is_set():
+            try:
+                await asyncio.wait_for(_agent_done.wait(), timeout=65.0)
+            except (TimeoutError, asyncio.CancelledError, Exception):
+                if _agent_task and not _agent_task.done():
+                    # 长任务仍在运行 — 不立即取消，注册后台保存回调。
+                    # 任务完成时回调会 drain queue 并保存 session。
+                    _bg_save_scheduled = True
+                    _schedule_background_save(
+                        _agent_task,
+                        _agent_done,
+                        _agent_queue,
+                        _sse,
+                        session,
+                        session_manager,
+                        conversation_id,
+                        _full_reply,
+                        _collected_artifacts,
+                        _save_done,
+                    )
+
+        # Drain remaining queue events to accumulate _full_reply for deferred save
+        if not _save_done and not _bg_save_scheduled:
+            try:
+                while not _agent_queue.empty():
+                    ev = _agent_queue.get_nowait()
+                    if ev is None or ev.get("type") == "__agent_error__":
+                        break
+                    et = ev.get("type", "")
+                    _chain_timeline_builder.observe(ev)
+                    if et != "done":
+                        _sse(et, {k: v for k, v in ev.items() if k != "type"})
+            except Exception:
+                pass
+            # Deferred session save
+            _deferred_text = _full_reply or _chain_reply
+            if session and _deferred_text:
+                try:
+                    _deferred_meta: dict = {}
+                    if _collected_artifacts:
+                        _deferred_meta["artifacts"] = _collected_artifacts
+                    _deferred_timeline = _chain_timeline_builder.build()
+                    if _deferred_timeline:
+                        _deferred_meta["chain_timeline"] = _deferred_timeline
+                    session.add_message("assistant", _deferred_text, **_deferred_meta)
+                    if session_manager:
+                        session_manager.persist()
+                    logger.info(
+                        f"[Chat API] Deferred save: {len(_deferred_text)} chars "
+                        f"(client_disconnected={_client_disconnected})"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Chat API] Deferred save failed: {e}")
+
+        # ── 清理断连检测任务 ──
+        if _disconnect_watcher_task and not _disconnect_watcher_task.done():
+            _disconnect_watcher_task.cancel()
+            try:
+                await _disconnect_watcher_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # ── 清理 agent task ──
+        if _agent_task and not _agent_task.done() and not _bg_save_scheduled:
+            _agent_task.cancel()
+            try:
+                await _agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                import openakita.main as _main_mod
+                _orch = getattr(_main_mod, "_orchestrator", None)
+                _sid = chat_request.conversation_id or ""
+                if _orch is not None and _sid:
+                    _orch.cancel_request(_sid)
+            except Exception as _e:
+                logger.debug(f"[Chat API] purge sub-agent states failed: {_e}")
+
+        # ── Release busy lock (via lifecycle manager) & broadcast message update ──
+        _conv_id = chat_request.conversation_id or ""
+        if _conv_id:
+            await get_lifecycle_manager().finish(_conv_id, generation=busy_generation)
+            if _full_reply:
+                await _broadcast_chat_event(
+                    "chat:message_update",
+                    {
+                        "conversation_id": _conv_id,
+                        "client_id": getattr(chat_request, "client_id", "") or "",
+                        "last_message_preview": _full_reply[:100],
+                        "timestamp": time.time(),
+                    },
+                )
+
+        # v1.27.14 (plan: v1.28, S1.6): mark turn finished so subsequent
+        # retries with the same turn_id receive turn_already_finished 409
+        # instead of opening a duplicate stream.
+        _turn_id = (getattr(chat_request, "turn_id", "") or "").strip()
+        if _turn_id:
+            from .turn_registry import get_turn_registry
+
+            try:
+                if _full_reply:
+                    await get_turn_registry().mark_succeeded(
+                        _turn_id, summary=_full_reply[:80]
+                    )
+                else:
+                    await get_turn_registry().mark_failed(
+                        _turn_id, summary="no_reply"
+                    )
+            except Exception:
+                logger.debug(
+                    "[Chat API] turn_registry mark failed for turn_id=%s",
+                    _turn_id,
+                    exc_info=True,
+                )
+
+
+def _org_file_attachments_to_chat_attachments(attachments: list[dict]) -> list[dict]:
+    """Convert org runtime file attachments to ChatView attachment objects."""
+    from pathlib import Path
+
+    converted: list[dict] = []
+    seen: set[str] = set()
+    for att in attachments or []:
+        if not isinstance(att, dict):
+            continue
+        file_path = str(att.get("file_path") or att.get("path") or "").strip()
+        if not file_path:
+            continue
+        key = file_path.lower().replace("\\", "/")
+        if key in seen:
+            continue
+        seen.add(key)
+        name = str(att.get("filename") or Path(file_path).name or "file")
+        suffix = Path(name).suffix.lower()
+        att_type = "document" if suffix in {".doc", ".docx", ".pdf", ".md", ".txt"} else "file"
+        converted.append({
+            "type": att_type,
+            "name": name,
+            "localPath": file_path,
+            "size": att.get("file_size") or att.get("size"),
+            "uploadStatus": "uploaded",
+        })
+    return converted
+
+
+def _enrich_org_content_with_attachments(
+    content: str, attachments: list | None
+) -> str:
+    """Read text file content from desktop attachments and append to org content.
+
+    Mirrors the gateway's ``_extract_text_file_content`` logic for the desktop
+    API path so that org commands submitted from the setup-center can include
+    file contents inline.
+    """
+    if not attachments:
+        return content
+
+    from pathlib import Path
+
+    from openakita.channels.gateway import MessageGateway
+
+    parts: list[str] = []
+    for att in attachments:
+        local_path = getattr(att, "local_path", None) or ""
+        if not local_path:
+            continue
+        fpath = Path(local_path)
+        if not fpath.exists():
+            continue
+        name = getattr(att, "name", None) or fpath.name
+        suffix = fpath.suffix.lower()
+        mime = getattr(att, "mime_type", None) or ""
+        try:
+            if suffix in MessageGateway._TEXT_FILE_EXTENSIONS or (
+                mime and mime.startswith("text/")
+            ):
+                if fpath.stat().st_size <= MessageGateway._TEXT_FILE_SIZE_LIMIT:
+                    file_content = fpath.read_text(encoding="utf-8", errors="replace")
+                    parts.append(
+                        f"\n\n--- 文件: {name} ---\n{file_content}\n--- 文件结束 ---"
+                    )
+                else:
+                    parts.append(
+                        f"\n[附件: {name} ({mime or suffix}), "
+                        f"文件过大无法内联，本地路径: {local_path}]"
+                    )
+            elif suffix == ".pdf" or (mime and "pdf" in mime):
+                parts.append(f"\n[附件: {name} (PDF), 本地路径: {local_path}]")
+            else:
+                parts.append(
+                    f"\n[附件: {name} ({mime or suffix}), 本地路径: {local_path}]"
+                )
+        except Exception:
+            logger.warning(f"Failed to read attachment for org content: {local_path}")
+    if parts:
+        return content + "".join(parts)
+    return content
+
+
+async def _stream_org_command_chat(
+    chat_request: ChatRequest,
+    *,
+    request: Request,
+    conversation_id: str,
+    client_id: str,
+    busy_generation: int,
+) -> AsyncIterator[str]:
+    """Stream a desktop-chat initiated org command as summarized SSE events."""
+
+    def _sse(event_type: str, data: dict | None = None) -> str:
+        from ...events import normalize_stream_event
+
+        payload = normalize_stream_event({"type": event_type, **(data or {})})
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    svc = getattr(request.app.state, "org_command_service", None)
+    session_manager = getattr(request.app.state, "session_manager", None)
+    org_id = chat_request.org_id or ""
+    target_node_id = chat_request.org_node_id or None
+    queue = None
+    command_id = ""
+
+    try:
+        if session_manager:
+            session = session_manager.get_session(
+                channel="desktop",
+                chat_id=conversation_id,
+                user_id="desktop_user",
+                create_if_missing=True,
+            )
+            if session:
+                session.set_metadata(
+                    "ui_org_state",
+                    {
+                        "orgMode": bool(chat_request.org_mode and chat_request.org_id),
+                        "orgId": org_id,
+                        "orgNodeId": target_node_id or "",
+                    },
+                )
+                if chat_request.message:
+                    session.add_message("user", chat_request.message)
+                session_manager.mark_dirty()
+
+        if svc is None:
+            yield _sse("error", {"message": "OrgCommandService not initialized"})
+            yield _sse("done")
+            return
+
+        from openakita.orgs.command_service import (
+            OrgCommandError,
+            OrgCommandRequest,
+            OrgCommandSource,
+            OrgCommandSurface,
+            default_scope_for_surface,
+        )
+
+        # Enrich org content with text from uploaded file attachments
+        org_content = chat_request.message or ""
+        if chat_request.attachments:
+            org_content = _enrich_org_content_with_attachments(
+                org_content, chat_request.attachments
+            )
+
+        try:
+            started = svc.submit(
+                OrgCommandRequest(
+                    org_id=org_id,
+                    content=org_content,
+                    target_node_id=target_node_id,
+                    source=OrgCommandSource(
+                        channel="desktop",
+                        chat_id=conversation_id,
+                        user_id="desktop_user",
+                        client_id=client_id,
+                    ),
+                    origin_surface=OrgCommandSurface.DESKTOP_CHAT,
+                    output_scope=default_scope_for_surface(OrgCommandSurface.DESKTOP_CHAT),
+                )
+            )
+        except OrgCommandError as exc:
+            yield _sse("error", {"message": str(exc), "org_id": org_id})
+            yield _sse("done")
+            return
+
+        command_id = started["command_id"]
+        queue = svc.subscribe_summary(
+            command_id,
+            surface="desktop_chat",
+            target=conversation_id,
+        )
+        yield _sse("org_command_started", {
+            "org_id": org_id,
+            "command_id": command_id,
+            "root_node_id": started.get("root_node_id", ""),
+        })
+
+        final_text = ""
+        # 进度行只用于历史持久化中的 org_timeline 字段，前端已经通过 org_progress
+        # 事件实时构建独立的 timeline 卡片，不再需要把它塞进 text_replace 正文。
+        progress_entries: list[dict] = []
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=30)
+            except TimeoutError:
+                yield _sse("heartbeat", {"org_id": org_id, "command_id": command_id})
+                continue
+
+            if item.get("type") == "org_progress":
+                summary = item.get("summary") or ""
+                if summary:
+                    progress_entries.append({
+                        "status": "progress",
+                        "summary": str(summary),
+                        "node_id": item.get("node_id"),
+                        "category": item.get("category") or item.get("label"),
+                        "timestamp": int(time.time() * 1000),
+                    })
+                    yield _sse("org_progress", item)
+                continue
+
+            if item.get("type") == "org_command_done":
+                result = item.get("result")
+                error = item.get("error")
+                attachments: list[dict] = []
+                if isinstance(result, dict):
+                    final_text = str(result.get("result") or result.get("error") or "")
+                    raw_attachments = result.get("file_attachments") or []
+                    if isinstance(raw_attachments, list):
+                        attachments = [a for a in raw_attachments if isinstance(a, dict)]
+                if error:
+                    final_text = str(error)
+                yield _sse("org_command_done", item)
+                if final_text:
+                    chat_attachments = _org_file_attachments_to_chat_attachments(attachments)
+                    # text_replace 只承载最终回复正文；过程展示由前端的 OrgTimelineCard
+                    # 通过 org_progress 累计渲染，避免"过程引用 + 分隔线 + 回复"
+                    # 全塞在一坨 markdown 里。
+                    yield _sse(
+                        "text_replace",
+                        {"content": final_text, "attachments": chat_attachments},
+                    )
+                    if session_manager:
+                        session = session_manager.get_session(
+                            channel="desktop",
+                            chat_id=conversation_id,
+                            user_id="desktop_user",
+                            create_if_missing=True,
+                        )
+                        if session:
+                            meta: dict[str, Any] = {}
+                            if chat_attachments:
+                                meta["attachments"] = chat_attachments
+                            if progress_entries:
+                                meta["org_timeline"] = [
+                                    *progress_entries,
+                                    {
+                                        "status": "done",
+                                        "summary": "组织命令已结束",
+                                        "timestamp": int(time.time() * 1000),
+                                    },
+                                ]
+                            session.add_message("assistant", final_text, **meta)
+                            session_manager.mark_dirty()
+                yield _sse("done")
+                return
+    finally:
+        if queue is not None and command_id and svc is not None:
+            svc.unsubscribe_summary(command_id, queue)
+        if client_id:
+            with contextlib.suppress(Exception):
+                await get_lifecycle_manager().finish(conversation_id, generation=busy_generation)
+
+
+@router.post("/api/chat")
+async def chat(request: Request, body: ChatRequest):
+    """
+    Chat endpoint with SSE streaming.
+
+    Uses the full Agent pipeline (shared with IM/CLI channels)
+    via Agent.chat_with_session_stream().
+
+    Each conversation gets its own Agent instance via AgentInstancePool
+    to support concurrent streaming without shared-state corruption.
+
+    Returns Server-Sent Events with the following event types
+    (canonical definitions in openakita.events.StreamEventType):
+    - heartbeat / iteration_start
+    - thinking_start / thinking_delta / thinking_end / chain_text
+    - text_delta
+    - tool_call_start / tool_call_end
+    - context_compressed
+    - security_confirm / ask_user
+    - todo_created / todo_step_updated / todo_completed / todo_cancelled
+    - agent_handoff / user_insert
+    - artifact / ui_preference
+    - error
+    - done (with optional usage payload)
+    """
+    import uuid as _uuid
+
+    pool = getattr(request.app.state, "agent_pool", None)
+    if not body.conversation_id:
+        if pool is not None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "missing_conversation_id",
+                    "message": "conversation_id is required in pool mode to avoid agent instance leaks",
+                },
+            )
+        body.conversation_id = f"api_{_uuid.uuid4().hex[:12]}"
+
+    conversation_id = body.conversation_id
+    client_id = body.client_id or ""
+    request_id = f"chat_{_uuid.uuid4().hex[:12]}"
+
+    if not (body.message or "").strip() and not body.attachments:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "empty_message", "message": "消息内容不能为空"},
+        )
+
+    try:
+        pending_response = await _handle_pending_risk_answer(
+            request=request,
+            conversation_id=conversation_id,
+            answer=body.message or "",
+            as_stream=True,
+        )
+    except Exception as exc:
+        return _chat_startup_error_response(
+            exc,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            stage="pending_risk_answer",
+        )
+    if isinstance(pending_response, _RiskAuthorizedReplay):
+        # 用户已对上一轮高风险请求授权，且无受控执行入口 — 用原始 message
+        # 替换当前的"确认继续"，让 LLM 重新规划工具调用。后续 risk gate
+        # 会通过 session metadata 中的 risk_authorized_replay 跳过二次拦截。
+        body.message = pending_response.original_message
+    elif pending_response is not None:
+        return pending_response
+
+    # ── Per-turn idempotency short-circuit ──
+    # (v1.27.14, plan: conversation concurrency v1.28, S1.6)
+    # 客户端可在 body.turn_id 提供一个稳定 ID（前端 retry / SSE 重连用同
+    # 一个 turn_id；用户重新点 send 用新 turn_id）。同 turn_id 在 TTL=60s
+    # 内重发返回 409 + Retry-After，避免重复开 SSE 流写脏 session。
+    turn_id = (getattr(body, "turn_id", None) or "").strip()
+    if turn_id:
+        from .turn_registry import get_turn_registry
+
+        registry = get_turn_registry()
+        status, _rec = await registry.begin(turn_id)
+        if status == "in_flight":
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "turn_already_processing",
+                    "turn_id": turn_id,
+                    "conversation_id": conversation_id,
+                    "retry_after_ms": 2000,
+                    "message": "上一次相同请求仍在处理中，请稍后再试。",
+                },
+                headers={"Retry-After": "2"},
+            )
+        # succeeded / failed: 也按"重复请求"短路；客户端要新请求得换 turn_id。
+        if status in ("succeeded", "failed"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "turn_already_finished",
+                    "turn_id": turn_id,
+                    "conversation_id": conversation_id,
+                    "previous_status": status,
+                    "message": "该 turn_id 上一次已完成。若是新消息，请使用新的 turn_id。",
+                },
+            )
+
+    # ── Busy-lock check (via lifecycle manager) ──
+    # v1.27.14 FIX 2/3: honour DoubleTextingPolicy at the HTTP layer.
+    # Default for desktop is QUEUE (per settings.double_texting_per_channel).
+    # On QUEUE same-client conflict we await wait_for_idle and retry once
+    # before falling back to 409.  Header X-OpenAkita-DoubleTexting can
+    # override per request (used by frontend "force interrupt" button when
+    # double_texting_allow_interrupt is enabled).
+    from .double_texting import resolve_policy
+
+    _dt_header = request.headers.get("x-openakita-doubletexting")
+    _dt_policy = resolve_policy(channel="desktop", header_value=_dt_header)
+
+    lifecycle = get_lifecycle_manager()
+    busy_gen = 0
+    if client_id:
+        try:
+            start_result = await lifecycle.start(
+                conversation_id,
+                client_id,
+                policy=_dt_policy,
+                turn_id=turn_id or None,
+            )
+            conflict = start_result.conflict
+            busy_gen = start_result.generation
+        except Exception as exc:
+            return _chat_startup_error_response(
+                exc,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                stage="conversation_lifecycle",
+            )
+
+        # P1-4 (v1.27.15): STEER policy short-circuit.  Lifecycle didn't
+        # acquire the lock; we just need to hand the new message off to
+        # the still-running ReAct loop via insert_user_message and tell
+        # the client "we got it, follow the existing stream via
+        # /api/chat/resume".
+        if start_result.steered:
+            actual_agent = _resolve_agent(_get_existing_agent(request, conversation_id))
+            ok = False
+            if actual_agent is not None:
+                try:
+                    # FIX-E (post-S2 audit): STEER is "user wanted to add
+                    # to the running task" — the new message MUST land in
+                    # the active task's pending_user_inserts buffer even
+                    # if the client immediately disconnects (e.g. mobile
+                    # browser tab swipe-away).  Without shield, a client
+                    # cancel between the HTTP request landing and the
+                    # insert completing would silently drop the message
+                    # and the user would think "I sent it but the agent
+                    # never saw it."  insert_user_message is fast (single
+                    # asyncio.Lock acquire + list append), so the shield
+                    # cannot meaningfully delay cancel propagation.
+                    ok = await asyncio.shield(
+                        actual_agent.insert_user_message(
+                            body.message or "",
+                            session_id=conversation_id,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("[Chat API] STEER insert failed: %s", exc)
+                    ok = False
+            if turn_id:
+                from .turn_registry import get_turn_registry
+
+                # Mark this turn as succeeded so a retry with the same
+                # turn_id is treated as duplicate (steered messages are
+                # not "new turns" — they are appendices to the active one).
+                await get_turn_registry().mark_succeeded(
+                    turn_id, summary="steered"
+                )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "steered" if ok else "steer_failed",
+                    "conversation_id": conversation_id,
+                    "policy": _dt_policy.value,
+                    "message": (
+                        "已加入当前任务的上下文，请通过 /api/chat/resume 跟随原回复。"
+                        if ok
+                        else "Steer 失败：当前任务可能已结束，请重试发送新消息。"
+                    ),
+                    "resume_hint": {
+                        "endpoint": "/api/chat/resume",
+                        "params": {"conversation_id": conversation_id},
+                    },
+                },
+            )
+
+        # FIX 3 + P1-5: QUEUE same-client conflict → await previous lock
+        # inside a StreamingResponse generator so we can emit SSE keepalive
+        # pings while waiting (nginx/cloudflare drop the socket after 30-60s
+        # of no data; the wait can legitimately take that long).  If
+        # wait_for_idle returns True we retry start() and fall back into
+        # the normal SSE pipeline; on timeout we emit a final error frame
+        # and close cleanly.
+        if (
+            conflict is not None
+            and start_result.queued_after_generation is not None
+        ):
+            from openakita.config import settings
+
+            _queue_timeout_s = max(0.5, settings.preempt_settle_timeout_ms / 1000.0)
+            _queued_after_gen = start_result.queued_after_generation
+            logger.info(
+                "[Chat API] QUEUE wait conv=%s after gen=%d (timeout=%.1fs)",
+                conversation_id,
+                _queued_after_gen,
+                _queue_timeout_s,
+            )
+
+            async def _queued_stream() -> AsyncIterator[str]:
+                # 1) Tell the client we're queued — gives the UI a chance
+                # to show "排队中…" instead of an opaque empty stream.
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "queued",
+                            "conversation_id": conversation_id,
+                            "after_generation": _queued_after_gen,
+                            "timeout_ms": settings.preempt_settle_timeout_ms,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+                # 2) Race wait_for_idle against a 5s ping loop.  We do this
+                # by polling wait_for_idle in 5s slices instead of one
+                # long await — same effect, but we get to yield ping
+                # between slices so transparent HTTP proxies don't kill
+                # the connection during long settle.
+                _PING_INTERVAL = 5.0
+                _waited = 0.0
+                _idle_reached = False
+                while _waited < _queue_timeout_s:
+                    _slice = min(_PING_INTERVAL, _queue_timeout_s - _waited)
+                    _slice_start = time.time()
+                    _idle_reached = await lifecycle.wait_for_idle(
+                        conversation_id,
+                        target_generation=_queued_after_gen,
+                        timeout=_slice,
+                    )
+                    _waited += time.time() - _slice_start
+                    if _idle_reached:
+                        break
+                    # Periodic ping — SSE comment line, ignored by all
+                    # spec-compliant clients but keeps proxies happy.
+                    yield f": ping queued-wait elapsed={_waited:.1f}s\n\n"
+                    if await request.is_disconnected():
+                        logger.info(
+                            "[Chat API] QUEUE wait abandoned (client disconnect) "
+                            "conv=%s",
+                            conversation_id,
+                        )
+                        return
+
+                if not _idle_reached:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "error",
+                                "error": "queue_timeout",
+                                "message": (
+                                    f"等待上一次任务结束超过 {settings.preempt_settle_timeout_ms}ms，"
+                                    "请稍后重试或显式取消上一次任务。"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    yield 'data: {"type": "done"}\n\n'
+                    if turn_id:
+                        try:
+                            from .turn_registry import get_turn_registry
+
+                            await get_turn_registry().mark_failed(
+                                turn_id, summary="queue_timeout"
+                            )
+                        except Exception:
+                            pass
+                    return
+
+                # 3) Idle reached — retry lifecycle.start.  If that still
+                # conflicts (rare; someone raced in between), surface a
+                # 409-style error frame and close.
+                try:
+                    retry_result = await lifecycle.start(
+                        conversation_id,
+                        client_id,
+                        policy=_dt_policy,
+                        turn_id=turn_id or None,
+                    )
+                except Exception as exc:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "error",
+                                "error": "lifecycle_retry_failed",
+                                "message": str(exc)[:200],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    yield 'data: {"type": "done"}\n\n'
+                    return
+
+                if retry_result.conflict is not None:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "error",
+                                "error": "conversation_busy",
+                                "message": (
+                                    "上一次任务结束后立即又有新任务占用，"
+                                    "请稍后重试。"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    yield 'data: {"type": "done"}\n\n'
+                    if turn_id:
+                        try:
+                            from .turn_registry import get_turn_registry
+
+                            await get_turn_registry().mark_failed(
+                                turn_id, summary="conversation_busy_after_queue"
+                            )
+                        except Exception:
+                            pass
+                    return
+
+                # 4) Got the lock — splice into the normal SSE pipeline.
+                # We delegate to _stream_chat exactly like the no-conflict
+                # path; the queued frame above already informed the UI.
+                #
+                # FIX-A (post-S2 audit): wrap everything from lock acquire
+                # to ownership-transfer in try/finally.  If the client
+                # cancels mid-await (network drop, browser tab close,
+                # browser-side fetch abort) between ``lifecycle.start``
+                # returning and ``_stream_chat`` 's finally block taking
+                # over, CancelledError would skip ``except Exception``
+                # and leak the lock forever — the conversation becomes
+                # un-startable until process restart.  The safety-net
+                # finish() below is idempotent (generation-guarded), so
+                # it is a no-op when _stream_chat already cleaned up.
+                _lock_owned_by_outer = True
+                try:
+                    try:
+                        _agent_lazy = await _get_agent_for_session(
+                            request,
+                            conversation_id,
+                            body.agent_profile_id,
+                        )
+                    except Exception as exc:
+                        await lifecycle.finish(
+                            conversation_id,
+                            generation=retry_result.generation,
+                        )
+                        _lock_owned_by_outer = False
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "error",
+                                    "error": "agent_init_failed",
+                                    "message": str(exc)[:200],
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        yield 'data: {"type": "done"}\n\n'
+                        return
+                    _sm_lazy = getattr(request.app.state, "session_manager", None)
+                    # Mirror the main path's mode resolution: plan_mode shim
+                    # + permission_mode override.  Don't duplicate the full
+                    # block here — the main flow's effective_mode lives only
+                    # in that scope, so we re-derive the minimal set.
+                    _eff_mode_lazy = body.mode
+                    if body.plan_mode and _eff_mode_lazy == "agent":
+                        _eff_mode_lazy = "plan"
+                    if body.permission_mode == "plan" and _eff_mode_lazy == "agent":
+                        _eff_mode_lazy = "plan"
+                    _requested_mode_lazy = body.mode
+                    body.mode = _eff_mode_lazy
+                    body.conversation_id = conversation_id
+
+                    _sub_gen = _stream_chat(
+                        body,
+                        _agent_lazy,
+                        _sm_lazy,
+                        http_request=request,
+                        busy_generation=retry_result.generation,
+                        request_id=request_id,
+                        requested_mode=_requested_mode_lazy,
+                    )
+                    if is_dual_loop():
+                        _sub_gen = engine_stream(_sub_gen)
+                    # Once we start iterating _sub_gen, its body enters
+                    # the try-block (the first yield suspends inside the
+                    # try), so its finally is guaranteed to run on any
+                    # subsequent cancel — flip the ownership flag so the
+                    # outer safety-net doesn't double-finish.
+                    async for _line in _sub_gen:
+                        if _lock_owned_by_outer:
+                            _lock_owned_by_outer = False
+                        yield _line
+                finally:
+                    if _lock_owned_by_outer:
+                        try:
+                            await lifecycle.finish(
+                                conversation_id,
+                                generation=retry_result.generation,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[Chat API] queued-stream safety-net "
+                                "finish failed (conv=%s, gen=%d)",
+                                conversation_id,
+                                retry_result.generation,
+                                exc_info=True,
+                            )
+
+            # IMPORTANT: do NOT call _stream_chat directly here.  The
+            # queued path needs its own StreamingResponse so the SSE
+            # connection opens immediately (so the proxy sees data
+            # within seconds), instead of blocking on wait_for_idle
+            # before even sending headers.
+            return StreamingResponse(
+                _queued_stream(),
+                media_type="text/event-stream; charset=utf-8",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        if conflict is not None:
+            # REJECT, cross-client, or QUEUE that timed out / re-conflicted
+            # after the wait. Mark the registered turn (if any) as failed so
+            # the client must supply a fresh turn_id to retry.
+            if turn_id:
+                from .turn_registry import get_turn_registry
+
+                await get_turn_registry().mark_failed(
+                    turn_id, summary="conversation_busy"
+                )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "conversation_busy",
+                    "conversation_id": conversation_id,
+                    "busy_client_id": conflict.client_id,
+                    "busy_since": conflict.start_time,
+                    "policy": _dt_policy.value,
+                    "message": "该会话正在其他终端进行中，请新建会话或稍后再试",
+                },
+            )
+
+    if body.org_mode and body.org_id:
+        body.conversation_id = conversation_id
+        sse_gen = _stream_org_command_chat(
+            body,
+            request=request,
+            conversation_id=conversation_id,
+            client_id=client_id,
+            busy_generation=busy_gen,
+        )
+        if is_dual_loop():
+            sse_gen = engine_stream(sse_gen)
+        return StreamingResponse(
+            sse_gen,
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    chat_endpoint_names = _chat_endpoint_names()
+    if not chat_endpoint_names:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "no_chat_endpoints_configured",
+                "message": (
+                    "尚未配置主聊天 LLM 端点。请在设置中心的「LLM 端点」中添加"
+                    "主聊天端点；编译端点只用于提示词编译/摘要，不能用于聊天。"
+                ),
+            },
+        )
+    if body.endpoint and body.endpoint not in chat_endpoint_names:
+        if body.endpoint_policy == "require":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "required_endpoint_not_found",
+                    "message": (
+                        f"指定的主聊天端点不存在或不可用: {body.endpoint}。"
+                        "endpoint_policy=require 表示必须严格使用该端点，因此不会自动切换。"
+                    ),
+                    "endpoint": body.endpoint,
+                    "endpoint_policy": body.endpoint_policy,
+                },
+            )
+        logger.warning(
+            "[Chat API] Ignoring stale chat endpoint %r; falling back to auto selection",
+            body.endpoint,
+        )
+        body.endpoint = None
+        body.endpoint_policy = "prefer"
+
+    if body.agent_profile_id:
+        from openakita.agents.presets import SYSTEM_PRESETS
+        from openakita.agents.profile import get_profile_store
+        _known = any(p.id == body.agent_profile_id for p in SYSTEM_PRESETS)
+        if not _known:
+            try:
+                _known = get_profile_store().get(body.agent_profile_id) is not None
+            except Exception:
+                _known = False
+        if not _known:
+            if client_id:
+                await lifecycle.finish(conversation_id, generation=busy_gen)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "unknown_agent_profile_id",
+                    "agent_profile_id": body.agent_profile_id,
+                    "message": f"未知的 agent_profile_id: {body.agent_profile_id}",
+                },
+            )
+
+    try:
+        agent = await _get_agent_for_session(request, conversation_id, body.agent_profile_id)
+        session_manager = getattr(request.app.state, "session_manager", None)
+    except Exception as exc:
+        if client_id:
+            await lifecycle.finish(conversation_id, generation=busy_gen)
+        return _chat_startup_error_response(
+            exc,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            stage="agent_init",
+        )
+
+    # Resolve effective mode: backward compat plan_mode=true -> mode="plan"
+    effective_mode = body.mode
+    if body.plan_mode and effective_mode == "agent":
+        effective_mode = "plan"
+    if body.permission_mode == "plan" and effective_mode == "agent":
+        effective_mode = "plan"
+    if session_manager is not None and conversation_id and body.permission_mode:
+        # v1.27.x introduced per-turn product permission_mode via the old
+        # PolicyEngine singleton. Policy V2 keeps that state on the session
+        # so build_policy_context can consume it without reviving core.policy.
+        _mode_map = {
+            "plan": "strict",
+            "default": "default",
+            "accept_edits": "accept_edits",
+            "dont_ask": "dont_ask",
+            "bypass_permissions": "trust",
+        }
+        try:
+            session = session_manager.get_session(
+                channel="desktop",
+                chat_id=conversation_id,
+                user_id="user",
+            )
+            session.confirmation_mode_override = _mode_map.get(body.permission_mode, "default")
+            session_manager.mark_dirty()
+        except Exception:
+            logger.debug("[Chat API] Failed to persist permission mode override", exc_info=True)
+
+    msg_preview = (body.message or "")[:100]
+    att_count = len(body.attachments) if body.attachments else 0
+
+    # Detect likely client-side encoding corruption: if the message is mostly
+    # '?' characters mixed with sparse ASCII, the client probably encoded
+    # Chinese/CJK text as ASCII with errors="replace" before sending.
+    _msg = body.message or ""
+    if len(_msg) > 2:
+        _q = _msg.count("?")
+        _non_ascii = sum(1 for c in _msg if ord(c) > 127)
+        if _q > len(_msg) * 0.4 and _non_ascii == 0:
+            logger.warning(
+                "[Chat API] 疑似编码损坏: 消息含 %d/%d 个问号且无非ASCII字符, "
+                "客户端可能在发送前将中文编码为ASCII(errors=replace)。"
+                "请确认客户端使用 UTF-8 编码 JSON body | conv=%s",
+                _q,
+                len(_msg),
+                conversation_id,
+            )
+
+    logger.info(
+        f'[Chat API] 收到消息: "{msg_preview}"'
+        + (f" (+{att_count}个附件)" if att_count else "")
+        + (f" | endpoint={body.endpoint}" if body.endpoint else "")
+        + (f" | endpoint_policy={body.endpoint_policy}" if body.endpoint else "")
+        + (f" | mode={effective_mode}" if effective_mode != "agent" else "")
+        + (f" | thinking={body.thinking_mode}" if body.thinking_mode else "")
+        + (f" | depth={body.thinking_depth}" if body.thinking_depth else "")
+        + (f" | conv={conversation_id}")
+        + (f" | client={client_id}" if client_id else "")
+    )
+
+    # Pass pre-resolved conversation_id so _stream_chat doesn't generate a new one
+    requested_mode = body.mode
+    body.mode = effective_mode
+    body.conversation_id = conversation_id
+
+    sse_gen = _stream_chat(
+        body,
+        agent,
+        session_manager,
+        http_request=request,
+        busy_generation=busy_gen,
+        request_id=request_id,
+        requested_mode=requested_mode,
+    )
+    if is_dual_loop():
+        sse_gen = engine_stream(sse_gen)
+
+    return StreamingResponse(
+        sse_gen,
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/chat/sync")
+async def chat_sync(request: Request, body: ChatRequest):
+    """Non-SSE chat endpoint for clients without streaming capability (C14 / R4-6).
+
+    Use when the client can't (or won't) consume Server-Sent Events from
+    ``POST /api/chat``: REST clients, CI pipelines, language-bindings without
+    SSE support, simple scripts piping curl results, etc.
+
+    Semantics differ from ``/api/chat`` in two important ways:
+
+    1. The created session is marked ``is_unattended=True`` (entry classifier
+       ``"api-sync"``). Tools whose policy class is CONFIRM will not block
+       waiting for an SSE ``security_confirm`` response — they instead route
+       through ``PolicyEngineV2`` step 11 → ``unattended_strategy`` (default
+       ``defer_to_inbox`` for this channel) and raise
+       ``DeferredApprovalRequired``.
+    2. The endpoint runs the **non-streaming** ``Agent.chat_with_session``
+       and returns one final JSON response. No incremental output.
+
+    Returns:
+        200 + JSON ``{status: "completed", conversation_id, message, ...}``
+            Agent finished normally; ``message`` is the final reply text.
+        202 + JSON ``{status: "pending_approval", approval_id, approval_url, ...}``
+            A CONFIRM tool was deferred. Client polls ``approval_url`` and
+            owner resolves via ``POST /api/pending_approvals/{id}/resolve``;
+            after approval the original task can be retried (replay-auth
+            window applies via the standard 30s mechanism).
+        4xx/5xx + JSON error envelope on validation/runtime failures.
+    """
+    import uuid as _uuid
+
+    from openakita.core.policy_v2 import (
+        DeferredApprovalRequired,
+        apply_classification_to_session,
+        classify_entry,
+    )
+
+    if not body.conversation_id:
+        body.conversation_id = f"api_sync_{_uuid.uuid4().hex[:12]}"
+    conversation_id = body.conversation_id
+    request_id = f"chat_sync_{_uuid.uuid4().hex[:12]}"
+
+    if not (body.message or "").strip() and not body.attachments:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "empty_message", "message": "消息内容不能为空"},
+        )
+
+    chat_endpoint_names = _chat_endpoint_names()
+    if not chat_endpoint_names:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "no_chat_endpoints_configured",
+                "message": "尚未配置主聊天 LLM 端点。",
+            },
+        )
+
+    try:
+        agent = await _get_agent_for_session(request, conversation_id, body.agent_profile_id)
+        session_manager = getattr(request.app.state, "session_manager", None)
+    except Exception as exc:
+        return _chat_startup_error_response(
+            exc,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            stage="agent_init",
+        )
+
+    actual_agent = _resolve_agent(agent)
+    if actual_agent is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "agent_not_ready", "message": "Agent 未初始化"},
+        )
+
+    if not actual_agent._initialized:
+        await actual_agent.initialize()
+
+    # C14 re-audit (D5): /api/chat/sync MUST enter the conversation
+    # lifecycle busy-lock, otherwise two concurrent sync calls on the
+    # same conversation_id race for the same Session.context message
+    # list. Mirror /api/chat SSE's lock pattern (start → 409 on conflict;
+    # finish in outer ``finally``). client_id is opaque to the lifecycle
+    # manager and only used to identify the holder in 409 responses, so
+    # using ``f"sync_{request_id}"`` is fine.
+    lifecycle = get_lifecycle_manager()
+    busy_gen = 0
+    sync_client_id = f"sync_{request_id}"
+    try:
+        conflict, busy_gen = await lifecycle.start(conversation_id, sync_client_id)
+    except Exception as exc:
+        return _chat_startup_error_response(
+            exc,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            stage="conversation_lifecycle",
+        )
+    if conflict is not None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "conversation_busy",
+                "conversation_id": conversation_id,
+                "busy_client_id": conflict.client_id,
+                "busy_since": conflict.start_time,
+                "message": (
+                    "该会话当前被其他请求占用，请等待空闲后重试 "
+                    "(可调用 GET /api/chat/busy 查询状态)。"
+                ),
+            },
+        )
+
+    try:
+        session = None
+        session_messages_history: list[dict] = []
+        if session_manager:
+            try:
+                session = session_manager.get_session(
+                    channel="api-sync",
+                    chat_id=conversation_id,
+                    user_id="api_sync_user",
+                    create_if_missing=True,
+                )
+                if session is not None:
+                    apply_classification_to_session(session, classify_entry("api-sync"))
+                    session.add_message("user", body.message or "")
+                    _backfill_ask_user_answer(session, body.message or "")
+                    session_messages_history = session.context.get_messages()
+            except Exception as exc:
+                logger.warning(
+                    "[Chat API /sync] session bootstrap failed: %s (conv=%s)",
+                    exc,
+                    conversation_id,
+                )
+
+        effective_mode = body.mode or "agent"
+        if body.plan_mode and effective_mode == "agent":
+            effective_mode = "plan"
+
+        try:
+            reply = await actual_agent.chat_with_session(
+                message=body.message or "",
+                session_messages=session_messages_history,
+                session_id=conversation_id,
+                session=session,
+                gateway=None,
+                mode=effective_mode,
+                endpoint_override=body.endpoint,
+                endpoint_policy=body.endpoint_policy,
+                thinking_mode=body.thinking_mode,
+                thinking_depth=body.thinking_depth,
+            )
+        except DeferredApprovalRequired as exc:
+            # C14 / R4-6 / C12 §14.2: CONFIRM-class tool routed through
+            # _handle_unattended → defer_to_inbox (or whatever the session
+            # configured). Hand the client an opaque approval_id + URL so they
+            # can poll the existing /api/pending_approvals/{id} endpoints
+            # without needing SSE.
+            approval_id = exc.pending_id or ""
+            return JSONResponse(
+                status_code=202,
+                headers=(
+                    {"Location": f"/api/pending_approvals/{approval_id}"}
+                    if approval_id
+                    else {}
+                ),
+                content={
+                    "status": "pending_approval",
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "approval_id": approval_id,
+                    "approval_url": (
+                        f"/api/pending_approvals/{approval_id}" if approval_id else None
+                    ),
+                    "resolve_url": (
+                        f"/api/pending_approvals/{approval_id}/resolve"
+                        if approval_id
+                        else None
+                    ),
+                    "unattended_strategy": exc.unattended_strategy,
+                    "message": (
+                        "工具调用需要 owner 审批；客户端可轮询 approval_url 获取状态，"
+                        "owner 在 setup-center 或通过 resolve_url 完成确认后请重新提交本次请求。"
+                    ),
+                },
+            )
+        except Exception as exc:
+            logger.exception(
+                "[Chat API /sync] runtime error (conv=%s, request=%s)",
+                conversation_id,
+                request_id,
+            )
+            return _chat_startup_error_response(
+                exc,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                stage="chat_with_session",
+            )
+
+        if session is not None:
+            try:
+                session.add_message("assistant", reply or "")
+            except Exception:
+                pass
+
+        return {
+            "status": "completed",
+            "conversation_id": conversation_id,
+            "request_id": request_id,
+            "message": reply or "",
+        }
+    finally:
+        try:
+            await lifecycle.finish(conversation_id, generation=busy_gen)
+        except Exception:
+            logger.warning(
+                "[Chat API /sync] lifecycle.finish failed (conv=%s, gen=%d)",
+                conversation_id,
+                busy_gen,
+            )
+
+
+@router.get("/api/chat/busy")
+async def chat_busy(
+    conversation_id: str = Query("", description="Filter by conversation ID (empty = all)"),
+):
+    """Return currently busy conversations."""
+    return await get_lifecycle_manager().get_busy_status(conversation_id)
+
+
+@router.post("/api/chat/answer")
+async def chat_answer(request: Request, body: ChatAnswerRequest):
+    """Handle user answer to an ask_user event."""
+    if body.conversation_id:
+        pending_response = await _handle_pending_risk_answer(
+            request=request,
+            conversation_id=body.conversation_id,
+            answer=body.answer,
+            as_stream=False,
+            remember_for_session=body.remember_for_session,
+        )
+        if isinstance(pending_response, _RiskAuthorizedReplay):
+            # 非流式接口：返回提示，要求前端重发 original_message。
+            return {
+                "status": "ok",
+                "kind": "risk_authorized_replay",
+                "conversation_id": body.conversation_id,
+                "confirmation_id": pending_response.confirmation_id,
+                "original_message": pending_response.original_message,
+                "message": (
+                    "已收到你的确认。请把原始请求重新发送，系统会在已授权状态下"
+                    "让模型重新规划工具调用。"
+                ),
+            }
+        if pending_response is not None:
+            return pending_response
+    return {
+        "status": "ok",
+        "conversation_id": body.conversation_id,
+        "answer": body.answer,
+        "hint": "No pending risk confirmation matched this conversation_id and answer.",
+    }
+
+
+@router.get("/api/chat/resume")
+async def chat_resume(
+    request: Request,
+    conversation_id: str,
+    since_seq: int = 0,
+):
+    """Read-only SSE attach to an in-flight agent task.
+
+    v1.27.15 (S2 P0-1, follow-up to S1).  Solves the "agent still running
+    but UI shows nothing after reconnect" problem.
+
+    Why a separate endpoint instead of just letting POST /api/chat with
+    Last-Event-ID re-enter?
+    --------------------------------------------------------------
+    S1 made ``POST /api/chat`` go through ``lifecycle.start()`` which
+    409s same-conversation overlap (REJECT) or QUEUE-waits up to 30s
+    (QUEUE).  Either way a reconnecting client can't actually get back
+    to the original SSE stream — it would either be rejected or queued
+    behind the still-running task forever.  The C17 Phase B replay
+    logic inside ``_stream_chat`` therefore became unreachable in the
+    common case.
+
+    This endpoint is **strictly read-only attach**:
+
+    * Does NOT touch ``ConversationLifecycleManager`` (no busy-lock
+      change, no generation bump, no policy resolution).
+    * Does NOT call any Agent method, does NOT register a turn in
+      ``TurnRegistry``.
+    * Does NOT modify the SSE session except by reading its current_seq.
+
+    Flow:
+    1. Flush ringbuffer events with ``seq > since_seq`` immediately
+       (this carries replay frames with their ORIGINAL seq so the
+       client's ``seenSequenceNums`` dedup works).
+    2. Tail-poll the ringbuffer every 100ms; whenever ``current_seq``
+       advances, flush the newly-buffered events.
+    3. Exit when ANY of:
+       - Client disconnects (``request.is_disconnected()``).
+       - Lifecycle reports the conversation idle (task ended).
+       - 15 minutes elapse with no new events (matches the SSE
+         disconnect grace period — beyond this we'd just be a leak).
+
+    The same conversation can have multiple concurrent ``/resume``
+    subscribers (e.g. user has the app open on two devices); each gets
+    its own polling loop reading the shared ringbuffer.
+
+    Query params:
+        conversation_id: required.  The conversation to attach to.
+        since_seq: optional, default 0.  Skip events with seq <= this
+            value.  Pass the highest seq the client has already rendered
+            to avoid double-rendering after a reconnect.
+    """
+    from ...core.sse_replay import format_sse_frame
+    from ...core.sse_replay import get_registry as _get_sse_registry
+
+    sse_session = _get_sse_registry().get(conversation_id)
+    if sse_session is None:
+        # No buffered events for this conversation at all (process restart,
+        # GC'd after TTL, or the conversation never streamed anything).
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "no_sse_session",
+                "conversation_id": conversation_id,
+                "message": (
+                    "没有可恢复的会话流。可能是后端重启或会话已超时；"
+                    "请直接发起新消息。"
+                ),
+            },
+        )
+
+    lifecycle = get_lifecycle_manager()
+
+    async def _resume_stream() -> AsyncIterator[str]:
+        _tail_started_at = time.time()
+        _MAX_TAIL_SECONDS = 15 * 60  # 15min — matches DISCONNECT_GRACE_SECONDS
+        _POLL_INTERVAL = 0.1
+        _last_emitted_seq = since_seq if since_seq >= 0 else 0
+        _last_event_time = time.time()
+
+        # 1) Initial flush — everything past since_seq right now.
+        try:
+            initial = sse_session.replay_from(_last_emitted_seq)
+            if initial:
+                logger.info(
+                    "[Chat Resume] conv=%s flushing %d buffered event(s) "
+                    "(since_seq=%d → up to %d)",
+                    conversation_id,
+                    len(initial),
+                    _last_emitted_seq,
+                    initial[-1].seq,
+                )
+                for evt in initial:
+                    yield format_sse_frame(
+                        evt,
+                        data_json=json.dumps(evt.payload, ensure_ascii=False),
+                    )
+                    _last_emitted_seq = evt.seq
+                _last_event_time = time.time()
+
+            # Send a synthetic "resume_attached" so the client UI can
+            # transition out of "connecting…" state immediately even
+            # before the next real event arrives.
+            yield (
+                f"data: {json.dumps({'type': 'resume_attached', 'conversation_id': conversation_id, 'last_seq': _last_emitted_seq}, ensure_ascii=False)}\n\n"
+            )
+
+            # 2) Tail loop — poll for new events.
+            # FIX-C (post-S2 audit): emit SSE comment pings every
+            # SSE_KEEPALIVE_INTERVAL (15s) of idle so cloudflare /
+            # nginx / corporate proxies don't drop the resume socket
+            # while the underlying agent is taking a long thinking
+            # turn (LLM with extended-thinking can pause 30-60s
+            # between deltas).  Without this, mobile clients see the
+            # stream silently die after ~30s on idle.
+            _last_ping_time = time.time()
+            while True:
+                if time.time() - _tail_started_at > _MAX_TAIL_SECONDS:
+                    logger.info(
+                        "[Chat Resume] conv=%s max tail duration reached, closing",
+                        conversation_id,
+                    )
+                    break
+                try:
+                    if await request.is_disconnected():
+                        logger.debug(
+                            "[Chat Resume] conv=%s client disconnected", conversation_id
+                        )
+                        break
+                except Exception:
+                    pass
+
+                cur = sse_session.current_seq
+                if cur > _last_emitted_seq:
+                    new_events = sse_session.replay_from(_last_emitted_seq)
+                    for evt in new_events:
+                        yield format_sse_frame(
+                            evt,
+                            data_json=json.dumps(evt.payload, ensure_ascii=False),
+                        )
+                        _last_emitted_seq = evt.seq
+                    _now = time.time()
+                    _last_event_time = _now
+                    _last_ping_time = _now
+                else:
+                    # No new events.  Check if the lifecycle says the
+                    # conversation is no longer busy and we've quiesced
+                    # for a bit — then we can close cleanly.
+                    try:
+                        status = await lifecycle.get_busy_status(conversation_id)
+                        busy = bool(status.get("busy"))
+                    except Exception:
+                        busy = False
+                    if not busy and time.time() - _last_event_time > 1.0:
+                        # Emit a synthetic done so the client can clean up.
+                        yield (
+                            f"data: {json.dumps({'type': 'done', 'reason': 'task_idle', 'last_seq': _last_emitted_seq}, ensure_ascii=False)}\n\n"
+                        )
+                        break
+                    # Idle but still busy — periodic keepalive ping so
+                    # the connection survives long LLM thinking turns.
+                    if time.time() - _last_ping_time >= 15.0:
+                        yield (
+                            f": ping resume-tail elapsed={(time.time() - _tail_started_at):.0f}s\n\n"
+                        )
+                        _last_ping_time = time.time()
+
+                await asyncio.sleep(_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            # Client gone or server shutdown.  Just exit; ringbuffer is
+            # unaffected so other subscribers / future reconnects still work.
+            logger.debug("[Chat Resume] conv=%s tail cancelled", conversation_id)
+            raise
+        except Exception as exc:  # pragma: no cover
+            logger.warning("[Chat Resume] conv=%s tail error: %s", conversation_id, exc)
+            yield (
+                f"data: {json.dumps({'type': 'error', 'message': f'resume tail failed: {exc!s}'[:200]}, ensure_ascii=False)}\n\n"
+            )
+
+    return StreamingResponse(
+        _resume_stream(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/chat/cancel")
+async def chat_cancel(request: Request, body: ChatControlRequest):
+    """Cancel the current running task for the specified conversation."""
+    conv_id = body.conversation_id
+    reason = body.reason or "用户从聊天界面取消任务"
+
+    # Org node sessions (e.g. "org:<org_id>:node:<node_id>") live in
+    # OrgRuntime._agent_cache, not in the chat agent_pool.  Route the
+    # cancel directly to the runtime so the correct Agent is stopped.
+    if conv_id and conv_id.startswith("org:"):
+        parts = conv_id.split(":")
+        if len(parts) >= 4 and parts[2] == "node":
+            org_id, node_id = parts[1], parts[3]
+            rt = getattr(request.app.state, "org_runtime", None)
+            if rt:
+                logger.info(
+                    f"[Chat API] Cancel routed to OrgRuntime: org={org_id}, node={node_id}"
+                )
+                result = await to_engine(rt.cancel_node_task(org_id, node_id, reason))
+                return {"status": "ok", "action": "cancel", "reason": reason, **result}
+
+    agent = _get_existing_agent(request, conv_id)
+    actual_agent = _resolve_agent(agent) if agent else None
+    if actual_agent is None:
+        logger.warning("[Chat API] Cancel failed: Agent not initialized")
+        return {"status": "error", "message": "Agent not initialized"}
+
+    _conv_id = conv_id or getattr(actual_agent, "_current_conversation_id", None)
+    logger.info(f"[Chat API] Cancel 接收到请求: reason={reason!r}, conv_id={_conv_id!r}")
+    actual_agent.cancel_current_task(reason, session_id=_conv_id)
+
+    # Immediately release busy-lock so the UI reflects the cancellation.
+    # _stream_chat's finally block will also call finish() with a generation
+    # guard, which will be a safe no-op since the lock is already released.
+    if _conv_id:
+        await get_lifecycle_manager().finish(_conv_id)
+
+    logger.info(f"[Chat API] Cancel 执行完成: reason={reason!r}")
+    return {"status": "ok", "action": "cancel", "reason": reason}
+
+
+@router.post("/api/chat/skip")
+async def chat_skip(request: Request, body: ChatControlRequest):
+    """Skip the current running tool/step (does not terminate the task)."""
+    conv_id = body.conversation_id
+    agent = _get_existing_agent(request, conv_id)
+    actual_agent = _resolve_agent(agent) if agent else None
+    if actual_agent is None:
+        return {"status": "error", "message": "Agent not initialized"}
+
+    reason = body.reason or "用户从聊天界面跳过当前步骤"
+    _conv_id = conv_id or getattr(actual_agent, "_current_conversation_id", None)
+    actual_agent.skip_current_step(reason, session_id=_conv_id)
+    logger.info(f"[Chat API] Skip requested: reason={reason!r}, conv_id={_conv_id!r}")
+    return {"status": "ok", "action": "skip", "reason": reason}
+
+
+@router.post("/api/chat/insert")
+async def chat_insert(request: Request, body: ChatControlRequest):
+    """Insert a user message into the running task context.
+
+    Smart routing: if the message is a stop/skip command, automatically
+    delegate to cancel/skip instead of blindly inserting.
+    """
+    conv_id = body.conversation_id
+    agent = _get_existing_agent(request, conv_id)
+    actual_agent = _resolve_agent(agent) if agent else None
+    if actual_agent is None:
+        logger.warning("[Chat API] Insert failed: Agent not initialized")
+        return {"status": "error", "message": "Agent not initialized"}
+
+    if not body.message:
+        return {"status": "error", "message": "Message is required for insert"}
+
+    logger.info(f"[Chat API] Insert 接收到消息: {body.message[:80]!r}")
+    msg_type = actual_agent.classify_interrupt(body.message)
+    logger.info(f"[Chat API] Insert 分类结果: msg_type={msg_type!r}, message={body.message[:60]!r}")
+
+    if msg_type == "stop":
+        reason = f"用户发送停止指令: {body.message}"
+        _conv_id = conv_id or getattr(actual_agent, "_current_conversation_id", None)
+        logger.info(f"[Chat API] Insert -> STOP: reason={reason!r}, conv_id={_conv_id!r}")
+        actual_agent.cancel_current_task(reason, session_id=_conv_id)
+        if _conv_id:
+            await get_lifecycle_manager().finish(_conv_id)
+        logger.info("[Chat API] Insert -> STOP 执行完成")
+        return {"status": "ok", "action": "cancel", "reason": reason}
+
+    if msg_type == "skip":
+        reason = f"用户发送跳过指令: {body.message}"
+        _skip_conv_id = conv_id or getattr(actual_agent, "_current_conversation_id", None)
+        ok = actual_agent.skip_current_step(reason, session_id=_skip_conv_id)
+        logger.info(f"[Chat API] Insert -> SKIP: reason={reason!r}, ok={ok}")
+        if not ok:
+            return {
+                "status": "warning",
+                "action": "skip",
+                "reason": reason,
+                "message": "No active task to skip",
+            }
+        return {"status": "ok", "action": "skip", "reason": reason}
+
+    _insert_conv_id = conv_id or getattr(actual_agent, "_current_conversation_id", None)
+    ok = await to_engine(actual_agent.insert_user_message(body.message, session_id=_insert_conv_id))
+    logger.info(f"[Chat API] Insert 作为普通消息: ok={ok}, message={body.message[:60]!r}")
+    if not ok:
+        return {
+            "status": "warning",
+            "action": "insert",
+            "message": "No active task, message dropped",
+        }
+    return {"status": "ok", "action": "insert", "message": body.message[:100]}
+
+
+@router.get("/api/agents/sub-tasks")
+async def get_sub_agent_tasks(request: Request, conversation_id: str = ""):
+    """Return live sub-agent states for a given conversation (polling endpoint)."""
+    orchestrator = None
+    try:
+        from openakita.main import _orchestrator
+
+        orchestrator = _orchestrator
+    except (ImportError, AttributeError):
+        pass
+    if orchestrator is None:
+        orchestrator = getattr(request.app.state, "orchestrator", None)
+    if orchestrator is None or not conversation_id:
+        return []
+    try:
+        return orchestrator.get_sub_agent_states(conversation_id)
+    except Exception as e:
+        logger.warning(f"[Chat API] sub-tasks query error: {e}")
+        return []
+
+
+@router.get("/api/agents/sub-records")
+async def get_sub_agent_records(request: Request, conversation_id: str = ""):
+    """Return persisted sub-agent work records for a conversation."""
+    if not conversation_id:
+        return []
+    session_manager = getattr(request.app.state, "session_manager", None)
+    if session_manager is None:
+        return []
+    try:
+        session = session_manager.get_session(
+            "desktop",
+            conversation_id,
+            "desktop_user",
+            create_if_missing=False,
+        )
+        if session and hasattr(session, "context"):
+            return getattr(session.context, "sub_agent_records", [])
+    except Exception as e:
+        logger.warning(f"[Chat API] sub-records query error: {e}")
+    return []
+
+
+@router.get("/api/chat/checkpoints")
+async def get_task_checkpoints(
+    request: Request,
+    conversation_id: str = "",
+    task_id: str = "",
+    limit: int = 20,
+):
+    """Return persisted task checkpoints for a conversation.
+
+    用途：让前端能基于上一次任务的 exit_reason / next_step_hint
+    给用户展示"继续此任务"提示，无需重新跑 LLM —— 用户只要在
+    输入框发"继续"等指令，现有 reason_stream 就会按现有机制接力。
+
+    Args:
+        conversation_id: 会话 ID（必填）。
+        task_id: 可选，仅返回该任务的检查点。
+        limit: 最多返回 N 条最新检查点，默认 20，硬上限 100。
+    """
+    if not conversation_id:
+        return {"checkpoints": [], "latest": None}
+    session_manager = getattr(request.app.state, "session_manager", None)
+    if session_manager is None:
+        return {"checkpoints": [], "latest": None}
+    try:
+        session = session_manager.get_session(
+            "desktop",
+            conversation_id,
+            "desktop_user",
+            create_if_missing=False,
+        )
+        if not session or not hasattr(session, "context"):
+            return {"checkpoints": [], "latest": None}
+        all_ckpts = list(getattr(session.context, "task_checkpoints", []) or [])
+        if task_id:
+            all_ckpts = [c for c in all_ckpts if c.get("task_id") == task_id]
+        capped = max(1, min(int(limit or 20), 100))
+        recent = all_ckpts[-capped:]
+        latest = recent[-1] if recent else None
+        return {"checkpoints": recent, "latest": latest}
+    except Exception as e:
+        logger.warning(f"[Chat API] task-checkpoints query error: {e}")
+        return {"checkpoints": [], "latest": None}
+
+
+@router.post("/api/plan/dismiss")
+async def dismiss_plan_approval(request: Request):
+    """用户关闭审批面板时清除后端 pending 状态"""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON body"}
+    conversation_id = body.get("conversation_id", "")
+    if not conversation_id:
+        return {"ok": False, "error": "missing conversation_id"}
+
+    agent = _get_existing_agent(request, conversation_id)
+    if agent is None:
+        return {"ok": True}
+
+    pending_map = getattr(agent, "_plan_exit_pending", None)
+    if isinstance(pending_map, dict):
+        pending_map.pop(conversation_id, None)
+    return {"ok": True}
+

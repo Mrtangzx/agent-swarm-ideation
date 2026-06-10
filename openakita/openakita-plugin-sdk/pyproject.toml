@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openakita-plugin-sdk"
+version = "0.7.0"
+description = "SDK for building OpenAkita plugins — protocols, base classes, testing helpers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "OpenAkita Team" }]
+keywords = ["openakita", "plugin", "sdk", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/openakita/openakita"
+Documentation = "https://docs.openakita.ai/plugins/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openakita_plugin_sdk"]

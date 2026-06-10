@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>OpenAkita 语音对话测试</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem auto; max-width: 720px; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .field { margin-bottom: 0.8rem; }
+  label { display: block; font-weight: 600; margin-bottom: 0.25rem; font-size: 0.9rem; }
+  input, button { padding: 0.5rem 0.75rem; font-size: 1rem; border-radius: 6px; border: 1px solid #ccc; }
+  input { width: 100%; font-family: ui-monospace, monospace; }
+  button { cursor: pointer; background: #2563eb; color: white; border: none; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  button.secondary { background: #6b7280; }
+  #log { white-space: pre-wrap; background: #111; color: #d4d4d4; padding: 1rem; border-radius: 8px; font-family: ui-monospace, monospace; font-size: 0.85rem; min-height: 200px; max-height: 400px; overflow-y: auto; }
+  .row { display: flex; gap: 0.5rem; align-items: center; }
+  #status { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.85rem; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.3rem; }
+  .idle   { background: #f3f4f6; color: #555; } .idle .dot { background: #aaa; }
+  .live   { background: #dcfce7; color: #166534; } .live .dot { background: #22c55e; }
+  .error  { background: #fee2e2; color: #991b1b; } .error .dot { background: #ef4444; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+  <h1>🐾 OpenAkita 语音对话测试</h1>
+  <p>在这个页面里连上本地 LiveKit server,对着麦克风说中文,会听到 agent 用 Edge TTS 朗读回复。</p>
+
+  <div class="field">
+    <label for="url">LiveKit URL</label>
+    <input id="url" value="ws://localhost:7880" />
+  </div>
+
+  <div class="field">
+    <label for="token">Access Token <small>(运行 <code>uv run python scripts/mint_livekit_token.py</code> 拿到)</small></label>
+    <input id="token" placeholder="粘贴 token, 例如 eyJhbGciOi..." />
+  </div>
+
+  <div class="row">
+    <button id="connect">连接</button>
+    <button id="disconnect" class="secondary" disabled>断开</button>
+    <span id="status" class="idle"><span class="dot"></span>未连接</span>
+  </div>
+
+  <h3>事件日志</h3>
+  <div id="log"></div>
+
+  <audio id="agentAudio" autoplay></audio>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script>
+const { Room, RoomEvent, Track, createLocalTracks, ConnectionState } = LiveKitClient;
+const log = (msg) => {
+  const el = document.getElementById('log');
+  const ts = new Date().toLocaleTimeString();
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+const setStatus = (state, text) => {
+  const el = document.getElementById('status');
+  el.className = state;
+  el.innerHTML = `<span class="dot"></span>${text}`;
+};
+
+let room = null;
+
+document.getElementById('connect').onclick = async () => {
+  const url = document.getElementById('url').value.trim();
+  const token = document.getElementById('token').value.trim();
+  if (!url || !token) { log('❌ 缺少 URL 或 token'); return; }
+  document.getElementById('connect').disabled = true;
+  document.getElementById('disconnect').disabled = false;
+  setStatus('live', '连接中...');
+
+  try {
+    room = new Room({ adaptiveStream: true, dynacast: true });
+    room.on(RoomEvent.ConnectionStateChanged, (s) => {
+      log(`🔌 ConnectionState = ${s}`);
+      if (s === ConnectionState.Connected) setStatus('live', '已连接');
+      if (s === ConnectionState.Disconnected) setStatus('idle', '已断开');
+    });
+    room.on(RoomEvent.ParticipantConnected, (p) => log(`👤 参与者加入: ${p.identity}`));
+    room.on(RoomEvent.ParticipantDisconnected, (p) => log(`👤 参与者离开: ${p.identity}`));
+    room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      log(`🎵 收到 track ${track.kind} from ${participant.identity}`);
+      if (track.kind === Track.Kind.Audio) {
+        const audioEl = track.attach();
+        audioEl.id = `audio-${participant.identity}`;
+        audioEl.autoplay = true;
+        document.body.appendChild(audioEl);
+      }
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      log(`🔇 track 取消订阅`);
+      track.detach().forEach((el) => el.remove());
+    });
+    room.on(RoomEvent.DataReceived, (payload, participant) => {
+      log(`📩 data from ${participant?.identity}: ${new TextDecoder().decode(payload)}`);
+    });
+
+    await room.connect(url, token);
+    log(`✅ 已连上 ${url} (room=${room.name}, me=${room.localParticipant.identity})`);
+
+    // 启动麦克风并发布
+    await room.localParticipant.setMicrophoneEnabled(true);
+    log(`🎤 麦克风已开启,请说话 (中文)`);
+  } catch (e) {
+    log(`❌ 连接失败: ${e.message || e}`);
+    setStatus('error', '连接失败');
+    document.getElementById('connect').disabled = false;
+    document.getElementById('disconnect').disabled = true;
+  }
+};
+
+document.getElementById('disconnect').onclick = async () => {
+  if (room) {
+    await room.disconnect();
+    room = null;
+    log(`🔌 已断开`);
+  }
+  document.getElementById('connect').disabled = false;
+  document.getElementById('disconnect').disabled = true;
+  setStatus('idle', '未连接');
+};
+</script>
+</body>
+</html>
